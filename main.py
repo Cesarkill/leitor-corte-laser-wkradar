@@ -38,6 +38,7 @@ MODELOS_RESERVA = ["gemini-4-hydrogen", "gemini-3.8-flash"]
 TEMPO_LIMITE_IA = 60
 
 CONTAGEM_SEGUNDOS = 10          # contagem regressiva antes de começar a digitar
+SETAS_OPERACAO_PADRAO = 3       # toques na seta p/ baixo no campo Operação
 ESPERA_APOS_SALVAR = 1.5        # valor padrão (ajustável na janela)
 TECLA_GRAVAR_PADRAO = "ENTER"   # "ENTER" ou "F2" (ajustável na janela)
 VALOR_UNITARIO_PADRAO = "0,00"
@@ -276,6 +277,7 @@ class App:
         self._f12_anterior = False
 
         # Variáveis do Painel de Calibração
+        self.var_setas_operacao = tk.StringVar(value=str(SETAS_OPERACAO_PADRAO))
         self.var_espera_salvar = tk.StringVar(value=f"{ESPERA_APOS_SALVAR:.1f}")
         self.var_tecla_gravar = tk.StringVar(value=TECLA_GRAVAR_PADRAO)
 
@@ -330,11 +332,17 @@ class App:
         cal = ttk.Frame(topo)
         cal.pack(side="right", padx=6)
 
+        ttk.Label(cal, text="Setas p/ baixo (Operação):").pack(side="left")
+        self.spn_setas_operacao = ttk.Spinbox(
+            cal, from_=0, to=20, increment=1, width=4,
+            textvariable=self.var_setas_operacao, font=("Segoe UI", 10))
+        self.spn_setas_operacao.pack(side="left", padx=(4, 10))
+
         ttk.Label(cal, text="Espera após salvar (s):").pack(side="left")
         self.spn_espera_salvar = ttk.Spinbox(
             cal, from_=0.2, to=15.0, increment=0.1, width=5,
             textvariable=self.var_espera_salvar, font=("Segoe UI", 10))
-        self.spn_espera_salvar.pack(side="left", padx=(4, 12))
+        self.spn_espera_salvar.pack(side="left", padx=(4, 10))
 
         ttk.Label(cal, text="Tecla para gravar:").pack(side="left")
         self.cmb_tecla_gravar = ttk.Combobox(
@@ -490,6 +498,14 @@ class App:
             text="▶️ Retomar (F12)" if (em_digitacao and self.pausado) else "⏸️ Pausar (F12)",
         )
         self.btn_parar.configure(state="normal" if em_digitacao else "disabled")
+
+    def _ler_setas_operacao(self) -> int:
+        try:
+            valor = int(self.var_setas_operacao.get().strip())
+            return max(0, min(valor, 50))
+        except ValueError:
+            self.var_setas_operacao.set(str(SETAS_OPERACAO_PADRAO))
+            return SETAS_OPERACAO_PADRAO
 
     def _ler_espera_salvar(self) -> float:
         try:
@@ -1124,6 +1140,7 @@ class App:
 
         # Fim dos 10 segundos: captura a posição do mouse sobre o campo OPERAÇÃO
         pos_operacao = pyautogui.position()
+        setas_operacao = self._ler_setas_operacao()
         espera_salvar = self._ler_espera_salvar()
         tecla_gravar = self._tecla_gravar_pyautogui()
         self._set_status(
@@ -1132,7 +1149,7 @@ class App:
         )
         threading.Thread(
             target=self._digitar,
-            args=(fila, pos_operacao, espera_salvar, tecla_gravar),
+            args=(fila, pos_operacao, setas_operacao, espera_salvar, tecla_gravar),
             daemon=True,
         ).start()
 
@@ -1155,7 +1172,8 @@ class App:
         return self._aguardar_pausa_ou_parada()
 
     def _digitar(self, fila: list[tuple[int, ItemCorte]],
-                 pos_operacao, espera_salvar: float, tecla_gravar: str):
+                 pos_operacao, setas_operacao: int,
+                 espera_salvar: float, tecla_gravar: str):
         total = len(fila)
         digitados_agora = 0
         try:
@@ -1175,21 +1193,23 @@ class App:
                     f"(qtd {item.quantidade_final})  [F12 pausa • Esc para]"
                 )
 
-                # 1. Voltar ao topo (Operação)
+                # 1. Clicar em pos_operacao para abrir a lista de opções e aguardar 0.3s
                 pyautogui.click(pos_operacao)
                 if self._dormir_interrompivel(0.3):
                     break
 
-                # 2. Selecionar "Entrada da Produção"
-                pyautogui.hotkey("alt", "down")
-                if self._dormir_interrompivel(0.3):
+                # 2. Pressionar 'down' o número de vezes de Setas p/ baixo (Operação) (0.1s cada)
+                parou_nas_setas = False
+                for _ in range(setas_operacao):
+                    pyautogui.press("down")
+                    if self._dormir_interrompivel(0.1):
+                        parou_nas_setas = True
+                        break
+                if parou_nas_setas:
                     break
-                pyautogui.write("entrada", interval=0.05)
-                if self._dormir_interrompivel(0.2):
-                    break
-                pyautogui.press("enter")
 
-                # 3. Pular "Cód. Barras" até "Produto"
+                # 3. Confirmar "Entrada da Produção" (Enter), aguardar 0.3s e pular Cód. Barras (Enter)
+                pyautogui.press("enter")
                 if self._dormir_interrompivel(0.3):
                     break
                 pyautogui.press("enter")
