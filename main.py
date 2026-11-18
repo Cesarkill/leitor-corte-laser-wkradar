@@ -80,8 +80,11 @@ class ItemCorte(BaseModel):
     )
     valor_unitario: str = Field(
         default=VALOR_UNITARIO_PADRAO,
-        description="Valor unitário se estiver anotado na folha (ex.: '12,50'); "
-                    "caso contrário, use sempre '0,00'."
+        description="Preço / valor unitário da peça na coluna 'Preço' (valores com 'R$'). "
+                    "O ponto (.) no preço impresso funciona como vírgula decimal (ex.: "
+                    "'R$ 199.906' = '199,90'; 'R$ 161.673' = '161,67'; 'R$ 10.97' = '10,97'). "
+                    "Retorne apenas o número com vírgula e 2 casas decimais (sem 'R$'). "
+                    "Se não houver preço na folha, use '0,00'."
     )
     local_destino: str = Field(
         default=LOCAL_DESTINO_PADRAO,
@@ -109,36 +112,56 @@ class ResultadoLeitura(BaseModel):
 PROMPT_SISTEMA = """\
 Você é um assistente especialista em ler folhas de controle de corte a laser de uma \
 indústria metalúrgica brasileira. As folhas são fotografadas com celular e contêm uma \
-tabela impressa com códigos de peças e quantidades, muitas vezes com anotações e \
-rasuras feitas à caneta pelo operador.
+tabela impressa (com colunas como #, IMG, Referência, Dobra, Preço, Dimensões, \
+Peças/Pedido, Tempo, Peso/KG), muitas vezes com anotações, marca-texto, clipes/post-its \
+e rasuras feitas à caneta pelo operador.
 
 REGRAS OBRIGATÓRIAS:
-1. CÓDIGO: transcreva o código da peça EXATAMENTE como aparece, caractere por \
-caractere, mantendo hífens (-), barras (/), pontos (.), underscores, letras \
-maiúsculas/minúsculas e zeros à esquerda. NÃO corrija, NÃO complete e NÃO \
-reformate códigos.
-2. QUANTIDADE RASURADA: quando a quantidade original impressa estiver riscada, \
-rasurada, circulada com correção ou sobrescrita, SEMPRE priorize o número escrito à \
-caneta (geralmente peças que queimaram/perderam no corte). Nesse caso, marque \
+1. CÓDIGO ("codigo"): fica na coluna "Referência" (ex.: "3.24.031", "L3.12.084D", \
+"P3.27.133"). Transcreva o código da peça EXATAMENTE como aparece, caractere por \
+caractere, mantendo pontos (.), hífens (-), barras (/), underscores, letras \
+maiúsculas/minúsculas e zeros à esquerda. NÃO use o número da primeira coluna "#" \
+como código.
+2. PREÇO / VALOR UNITÁRIO ("valor_unitario"):
+   - Fica na coluna "Preço" (os valores começam com "R$", mesmo que o título da coluna \
+esteja coberto por um clipe ou post-it).
+   - ATENÇÃO CRÍTICA: nessa folha, o PONTO (.) no preço funciona como VÍRGULA DECIMAL \
+(o software imprime 2 ou 3 casas decimais após o ponto). Portanto, NÃO é separador de \
+milhar!
+   - Exemplos reais:
+     * "R$ 199.906" significa 199 reais e 90 centavos -> retorne "199,90" (NUNCA 199 mil!).
+     * "R$ 161.673" -> retorne "161,67".
+     * "R$ 270.999" -> retorne "270,99".
+     * "R$ 3.927"   -> retorne "3,92".
+     * "R$ 10.97"   -> retorne "10,97".
+     * "R$ 1.65"    -> retorne "1,65".
+   - Sempre remova o "R$", troque o ponto por vírgula e mantenha APENAS as 2 primeiras \
+casas decimais (descarte a 3ª casa decimal sem arredondar para cima).
+   - Se o preço estiver riscado e corrigido à caneta, use o valor escrito à caneta.
+   - Só retorne "0,00" se a folha realmente não tiver coluna/valor de preço para a peça.
+3. QUANTIDADE ("quantidade_final") e RASURAS:
+   - A quantidade fica nas colunas "Peças" / "Pedido" (não confunda com a coluna "#" \
+nem com "Peso / KG" ou dimensões).
+   - Quando a quantidade original impressa estiver riscada, rasurada, circulada com \
+correção ou sobrescrita à caneta, SEMPRE priorize o número escrito à caneta \
+(geralmente peças que queimaram/perderam no corte). Nesse caso, marque \
 alterado_a_mao = true e descreva em "observacao" (ex.: "Riscado 15, escrito 12 - queimou").
-3. Se não houver rasura, use a quantidade impressa e marque alterado_a_mao = false.
-4. Se a correção à caneta indicar zero, ou a linha inteira estiver riscada \
+   - Traços ou vistos de conferência ("/") na coluna "Dobra" (SIM/NÃO) NÃO são rasuras \
+de quantidade. Se a quantidade não foi alterada à mão, marque alterado_a_mao = false.
+   - Se a correção à caneta indicar zero, ou a linha inteira estiver riscada \
 (peça cancelada), use quantidade_final = 0 e explique na observação.
-5. VALOR UNITÁRIO e LOCAL DE DESTINO:
-   - "valor_unitario": se houver um valor unitário anotado para a peça, transcreva-o \
-com vírgula (ex.: "10,50"); caso contrário, retorne sempre "0,00".
-   - "local_destino": retorne sempre "23" como padrão.
-6. VÁRIAS FOLHAS: você pode receber 2 ou mais imagens do mesmo lote. Se o MESMO \
+4. LOCAL DE DESTINO ("local_destino"): retorne sempre "23" como padrão.
+5. VÁRIAS FOLHAS: você pode receber 2 ou mais imagens do mesmo lote. Se o MESMO \
 código de peça aparecer repetido (na mesma folha ou entre folhas diferentes), \
 CONSOLIDE em um único item somando as quantidades finais. Mantenha \
 alterado_a_mao = true se QUALQUER uma das ocorrências tiver rasura, e mencione a \
 soma na observação (ex.: "somado: folha 1 = 5, folha 2 = 3").
-7. Se algum dígito estiver ilegível ou duvidoso, faça a melhor leitura possível e \
+6. Se algum dígito estiver ilegível ou duvidoso, faça a melhor leitura possível e \
 registre a dúvida na observação.
-8. Não invente peças. Ignore cabeçalhos, totais, datas, assinaturas e campos que \
+7. Não invente peças. Ignore cabeçalhos, totais, datas, assinaturas e campos que \
 não sejam linhas de peças.
-9. Mantenha a ordem em que as peças aparecem nas folhas.
-10. Deixe "observacao" como string vazia quando não houver nada relevante.
+8. Mantenha a ordem em que as peças aparecem nas folhas.
+9. Deixe "observacao" como string vazia quando não houver nada relevante.
 """
 
 
@@ -153,9 +176,40 @@ def _tecla_pressionada_global(vk_code: int) -> bool:
         return False
 
 
+def _formatar_valor_unitario(texto: str) -> str:
+    """Converte preços como 'R$ 199.906', '199.906', '199,906' ou '10.97' para '199,90' e '10,97'.
+
+    Na folha de corte, o ponto funciona como vírgula decimal (com 2 ou 3 casas).
+    Mantém apenas 2 casas decimais (truncando a 3ª casa, sem arredondar para cima).
+    """
+    s = (texto or "").strip()
+    if not s:
+        return VALOR_UNITARIO_PADRAO
+    s = s.replace("R$", "").replace("r$", "").strip()
+    # Se vier no formato "199.906,00" (IA interpretou ponto como milhar e adicionou ,00),
+    # desfaz para "199.906" quando houver apenas 1 ponto seguido de 3 dígitos e ",00":
+    if s.endswith(",00") and s.count(".") == 1 and s.count(",") == 1:
+        parte_ant = s[:-3]
+        partes_ponto = parte_ant.split(".")
+        if len(partes_ponto) == 2 and partes_ponto[0].isdigit() and len(partes_ponto[1]) == 3 and partes_ponto[1].isdigit():
+            s = parte_ant
+    # Agora trata '.' como ',' (separador decimal único)
+    s_norm = s.replace(".", ",")
+    if s_norm.count(",") == 1:
+        inteiro, dec = s_norm.split(",")
+        inteiro_limpo = "".join(c for c in inteiro if c.isdigit())
+        dec_limpo = "".join(c for c in dec if c.isdigit())
+        if inteiro_limpo:
+            dec_2 = (dec_limpo + "00")[:2]
+            return f"{int(inteiro_limpo)},{dec_2}"
+    elif s_norm.isdigit():
+        return f"{int(s_norm)},00"
+    return s
+
+
 def _normalizar_item(item: ItemCorte) -> ItemCorte:
-    """Garante padrões '0,00' para valor_unitario e '23' para local_destino."""
-    val = (item.valor_unitario or "").strip() or VALOR_UNITARIO_PADRAO
+    """Garante formatação correta de valor_unitario ('199,90') e padrão '23' para local_destino."""
+    val = _formatar_valor_unitario(item.valor_unitario)
     dest = (item.local_destino or "").strip() or LOCAL_DESTINO_PADRAO
     if val != item.valor_unitario or dest != item.local_destino:
         return item.model_copy(update={"valor_unitario": val, "local_destino": dest})
