@@ -1,0 +1,18 @@
+# Chave de API (NUNCA subir para o GitHub)
+.env
+*.env
+!.env.example
+
+# Ambiente virtual Python
+.venv/
+venv/
+ENV/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller (executáveis e builds)
+build/
+dist/
+*.spec

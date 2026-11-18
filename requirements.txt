@@ -1,0 +1,7 @@
+google-genai>=3.2.0
+pydantic
+pillow
+pyautogui
+pyperclip
+python-dotenv
+pyinstaller
