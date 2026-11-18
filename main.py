@@ -304,7 +304,7 @@ class App:
         estilo.configure("Instrucao.TLabel", font=("Segoe UI", 10, "bold"),
                          foreground="#8a4b00")
 
-        # --- barra superior (ações principais + calibração antes do botão iniciar)
+        # --- barra superior (arquivos, lista e pausa/parada)
         topo = ttk.Frame(self.root, padding=(10, 10, 10, 4))
         topo.pack(fill="x")
 
@@ -316,78 +316,66 @@ class App:
                                      command=self.limpar_lista)
         self.btn_editar = ttk.Button(topo, text="✏️ Editar Item",
                                      command=self._editar_selecionada_dialogo)
+        self.btn_desmarcar = ttk.Button(
+            topo, text="🔄 Desmarcar Digitados (✅)",
+            command=self.desmarcar_todos_digitados)
 
         self.btn_abrir.pack(side="left", padx=(0, 5))
         self.btn_colar.pack(side="left", padx=5)
         self.btn_limpar.pack(side="left", padx=5)
         self.btn_editar.pack(side="left", padx=5)
+        self.btn_desmarcar.pack(side="left", padx=5)
 
-        # Botão de iniciar à direita
-        self.btn_digitar = ttk.Button(
-            topo, text=f"⌨️ Digitar no WK Radar ({CONTAGEM_SEGUNDOS}s)",
-            command=self.iniciar_digitacao)
-        self.btn_digitar.pack(side="right", padx=(6, 0))
+        self.btn_parar = ttk.Button(
+            topo, text="⏹️ Parar (Esc)",
+            command=self.parar_digitacao, state="disabled")
+        self.btn_pausar = ttk.Button(
+            topo, text="⏸️ Pausar (F12)",
+            command=lambda: self.alternar_pausa(via_atalho=False), state="disabled")
+        self.btn_parar.pack(side="right", padx=(5, 0))
+        self.btn_pausar.pack(side="right", padx=5)
 
-        # Campos pequenos de calibração imediatamente antes do botão de iniciar
-        cal = ttk.Frame(topo)
-        cal.pack(side="right", padx=6)
-
-        ttk.Label(cal, text="Setas p/ baixo (Operação):").pack(side="left")
-        self.spn_setas_operacao = ttk.Spinbox(
-            cal, from_=0, to=20, increment=1, width=4,
-            textvariable=self.var_setas_operacao, font=("Segoe UI", 10))
-        self.spn_setas_operacao.pack(side="left", padx=(4, 10))
-
-        ttk.Label(cal, text="Espera após salvar (s):").pack(side="left")
-        self.spn_espera_salvar = ttk.Spinbox(
-            cal, from_=0.2, to=15.0, increment=0.1, width=5,
-            textvariable=self.var_espera_salvar, font=("Segoe UI", 10))
-        self.spn_espera_salvar.pack(side="left", padx=(4, 10))
-
-        ttk.Label(cal, text="Tecla para gravar:").pack(side="left")
-        self.cmb_tecla_gravar = ttk.Combobox(
-            cal, textvariable=self.var_tecla_gravar,
-            values=("ENTER", "F2"), state="readonly", width=7,
-            font=("Segoe UI", 10))
-        self.cmb_tecla_gravar.pack(side="left", padx=(4, 4))
-
-        # --- segunda barra: controles de execução do robô (Da Selecionada / Pausar / Parar)
+        # --- segunda barra: painel de calibração + botões de iniciar digitação
         barra_robo = ttk.LabelFrame(
-            self.root, text="Controle de Digitação (Entrada da Produção — WK Radar)",
-            padding=(10, 4, 10, 6))
+            self.root, text="Calibração e Digitação (Entrada da Produção — WK Radar)",
+            padding=(10, 6, 10, 8))
         barra_robo.pack(fill="x", padx=10, pady=(2, 4))
 
+        ttk.Label(barra_robo, text="Setas p/ baixo (Operação):").pack(side="left")
+        self.spn_setas_operacao = ttk.Spinbox(
+            barra_robo, from_=0, to=20, increment=1, width=5,
+            textvariable=self.var_setas_operacao, font=("Segoe UI", 10))
+        self.spn_setas_operacao.pack(side="left", padx=(4, 16))
+
+        ttk.Label(barra_robo, text="Espera após salvar (s):").pack(side="left")
+        self.spn_espera_salvar = ttk.Spinbox(
+            barra_robo, from_=0.2, to=15.0, increment=0.1, width=6,
+            textvariable=self.var_espera_salvar, font=("Segoe UI", 10))
+        self.spn_espera_salvar.pack(side="left", padx=(4, 16))
+
+        ttk.Label(barra_robo, text="Tecla para gravar:").pack(side="left")
+        self.cmb_tecla_gravar = ttk.Combobox(
+            barra_robo, textvariable=self.var_tecla_gravar,
+            values=("ENTER", "F2"), state="readonly", width=8,
+            font=("Segoe UI", 10))
+        self.cmb_tecla_gravar.pack(side="left", padx=(4, 12))
+
+        self.btn_digitar = ttk.Button(
+            barra_robo, text=f"⌨️ Digitar no WK Radar ({CONTAGEM_SEGUNDOS}s)",
+            command=self.iniciar_digitacao)
         self.btn_digitar_sel = ttk.Button(
-            barra_robo, text=f"▶️ Digitar da Linha Selecionada ({CONTAGEM_SEGUNDOS}s)",
+            barra_robo, text=f"▶️ Da Linha Selecionada ({CONTAGEM_SEGUNDOS}s)",
             command=self.iniciar_digitacao_da_selecionada)
-        self.btn_pausar = ttk.Button(
-            barra_robo, text="⏸️ Pausar (F12)",
-            command=lambda: self.alternar_pausa(via_atalho=False), state="disabled")
-        self.btn_parar = ttk.Button(
-            barra_robo, text="⏹️ Parar (Esc)",
-            command=self.parar_digitacao, state="disabled")
-        self.btn_desmarcar = ttk.Button(
-            barra_robo, text="🔄 Desmarcar Digitados (✅)",
-            command=self.desmarcar_todos_digitados)
+        self.btn_digitar.pack(side="right", padx=(6, 0))
+        self.btn_digitar_sel.pack(side="right", padx=6)
 
-        self.btn_digitar_sel.pack(side="left", padx=(0, 6))
-        self.btn_pausar.pack(side="left", padx=6)
-        self.btn_parar.pack(side="left", padx=6)
-        self.btn_desmarcar.pack(side="left", padx=6)
-
-        ttk.Label(
-            barra_robo,
-            text="Atalhos globais:  F12 = Pausar/Retomar  •  Esc = Parar  •  Mouse no canto sup. esq. = Abortar",
-            foreground="#005fb8", font=("Segoe UI", 9, "bold"),
-        ).pack(side="right")
-
-        # --- dica de edição
+        # --- dica de edição e atalhos
         ttk.Label(
             self.root,
             text=("Duplo clique na linha: editar campos (Código, Valor Unit., Destino, Qtd Final)  •  "
-                  "Linha selecionada + número: edita Qtd  •  + e − somam/subtraem 1  •  "
-                  "Delete: remover linha"),
-            foreground="#555", padding=(10, 0),
+                  "Atalhos globais na digitação: F12 = Pausar/Retomar  |  Esc = Parar  |  "
+                  "Mouse no canto sup. esq. = Abortar"),
+            foreground="#005fb8", padding=(10, 0),
         ).pack(fill="x")
 
         # --- tabela central
