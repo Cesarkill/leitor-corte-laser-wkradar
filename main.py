@@ -16,6 +16,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import winsound
 
 import pyautogui
 import pyperclip
@@ -39,13 +40,14 @@ TEMPO_LIMITE_IA = 60
 
 CONTAGEM_SEGUNDOS = 10          # contagem regressiva antes de começar a digitar
 SETAS_OPERACAO_PADRAO = 3       # toques na seta p/ baixo no campo Operação
-ESPERA_APOS_SALVAR = 1.5        # valor padrão (ajustável na janela)
-TECLA_GRAVAR_PADRAO = "ENTER"   # "ENTER" ou "F2" (ajustável na janela)
+ENTERS_APOS_QTD_PADRAO = 18     # 17 Enters até o botão OK + 1 Enter para confirmar
+ESPERA_APOS_OK = 1.5            # tempo (s) para salvar e limpar o formulário
 VALOR_UNITARIO_PADRAO = "0,00"
 LOCAL_DESTINO_PADRAO = "23"
 
 COR_ALTERADO = "#fff3cd"        # fundo amarelo claro das linhas com rasura à caneta
-COR_DIGITADO = "#d4edda"        # fundo verde claro das linhas já digitadas (✅)
+COR_LANCADO = "#d4edda"         # fundo verde claro das linhas já lançadas (✅)
+COR_POPUP = "#f8d7da"           # fundo vermelho claro quando abre pop-up no WK Radar
 TAMANHO_MAX_IMAGEM = 2400       # px (maior lado) antes de enviar para a API
 
 # Códigos de tecla virtual do Windows (atalhos globais via user32.GetAsyncKeyState)
@@ -53,8 +55,8 @@ VK_ESCAPE = 0x1B                # Esc  -> Parar digitação imediatamente
 VK_F12 = 0x7B                   # F12  -> Pausar / Retomar digitação
 
 INSTRUCAO_RODAPE = (
-    "Clique no campo OPERAÇÃO no WK Radar e deixe o mouse parado sobre ele "
-    "durante os 10 segundos."
+    "Clique no campo DATA (início do formulário) no WK Radar e deixe o mouse "
+    "parado ali durante os 10 segundos."
 )
 
 pyautogui.FAILSAFE = True       # mouse no canto superior esquerdo = aborta
@@ -102,7 +104,9 @@ class ItemCorte(BaseModel):
         description="Nota breve sobre rasuras (ex.: 'Riscado 15, escrito 12 - queimou'). "
                     "Vazio se não houver nada a observar."
     )
-    digitado: SkipJsonSchema[bool] = Field(default=False, exclude=True)
+    lancado: SkipJsonSchema[bool] = Field(default=False, exclude=True)
+    erro_popup: SkipJsonSchema[bool] = Field(default=False, exclude=True)
+    resolvida_manual: SkipJsonSchema[bool] = Field(default=False, exclude=True)
 
 
 class ResultadoLeitura(BaseModel):
@@ -174,6 +178,35 @@ def _tecla_pressionada_global(vk_code: int) -> bool:
         return (ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000) != 0
     except Exception:
         return False
+
+
+def obter_hwnd_ativo() -> int:
+    """Retorna o identificador (HWND) da janela atualmente ativa no Windows."""
+    try:
+        return int(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        return 0
+
+
+def obter_titulo_janela(hwnd: int) -> str:
+    """Lê o título da janela ativa via GetWindowTextW."""
+    if not hwnd:
+        return "(sem título)"
+    try:
+        user32 = ctypes.windll.user32
+        tamanho = user32.GetWindowTextLengthW(hwnd)
+        if tamanho <= 0:
+            return "(sem título)"
+        buffer = ctypes.create_unicode_buffer(tamanho + 1)
+        user32.GetWindowTextW(hwnd, buffer, tamanho + 1)
+        return buffer.value.strip() or "(sem título)"
+    except Exception:
+        return "(sem título)"
+
+
+def verificar_popup(hwnd_wk: int) -> bool:
+    """Retorna True sempre que outra janela/pop-up assumir o foco."""
+    return obter_hwnd_ativo() != hwnd_wk
 
 
 def _formatar_valor_unitario(texto: str) -> str:
@@ -319,8 +352,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Leitor de Corte a Laser → WK Radar (Entrada da Produção)")
-        self.root.geometry("1180x700")
-        self.root.minsize(980, 520)
+        self.root.geometry("1180x720")
+        self.root.minsize(980, 560)
 
         self.itens: list[ItemCorte] = []
         self.ocupado = False
@@ -329,11 +362,12 @@ class App:
         self.parar_solicitado = False
         self._esc_anterior = False
         self._f12_anterior = False
+        self.idx_pausado_popup: int | None = None
 
         # Variáveis do Painel de Calibração
         self.var_setas_operacao = tk.StringVar(value=str(SETAS_OPERACAO_PADRAO))
-        self.var_espera_salvar = tk.StringVar(value=f"{ESPERA_APOS_SALVAR:.1f}")
-        self.var_tecla_gravar = tk.StringVar(value=TECLA_GRAVAR_PADRAO)
+        self.var_enters_apos_qtd = tk.StringVar(value=str(ENTERS_APOS_QTD_PADRAO))
+        self.var_espera_apos_ok = tk.StringVar(value=f"{ESPERA_APOS_OK:.1f}")
 
         self._montar_interface()
 
@@ -358,7 +392,7 @@ class App:
         estilo.configure("Instrucao.TLabel", font=("Segoe UI", 10, "bold"),
                          foreground="#8a4b00")
 
-        # --- barra superior (arquivos, lista e pausa/parada)
+        # --- barra superior (arquivos e lista)
         topo = ttk.Frame(self.root, padding=(10, 10, 10, 4))
         topo.pack(fill="x")
 
@@ -371,7 +405,7 @@ class App:
         self.btn_editar = ttk.Button(topo, text="✏️ Editar Item",
                                      command=self._editar_selecionada_dialogo)
         self.btn_desmarcar = ttk.Button(
-            topo, text="🔄 Desmarcar Digitados (✅)",
+            topo, text="🔄 Desmarcar Lançados (✅)",
             command=self.desmarcar_todos_digitados)
 
         self.btn_abrir.pack(side="left", padx=(0, 5))
@@ -380,56 +414,13 @@ class App:
         self.btn_editar.pack(side="left", padx=5)
         self.btn_desmarcar.pack(side="left", padx=5)
 
-        self.btn_parar = ttk.Button(
-            topo, text="⏹️ Parar (Esc)",
-            command=self.parar_digitacao, state="disabled")
-        self.btn_pausar = ttk.Button(
-            topo, text="⏸️ Pausar (F12)",
-            command=lambda: self.alternar_pausa(via_atalho=False), state="disabled")
-        self.btn_parar.pack(side="right", padx=(5, 0))
-        self.btn_pausar.pack(side="right", padx=5)
-
-        # --- segunda barra: painel de calibração + botões de iniciar digitação
-        barra_robo = ttk.LabelFrame(
-            self.root, text="Calibração e Digitação (Entrada da Produção — WK Radar)",
-            padding=(10, 6, 10, 8))
-        barra_robo.pack(fill="x", padx=10, pady=(2, 4))
-
-        ttk.Label(barra_robo, text="Setas p/ baixo (Operação):").pack(side="left")
-        self.spn_setas_operacao = ttk.Spinbox(
-            barra_robo, from_=0, to=20, increment=1, width=5,
-            textvariable=self.var_setas_operacao, font=("Segoe UI", 10))
-        self.spn_setas_operacao.pack(side="left", padx=(4, 16))
-
-        ttk.Label(barra_robo, text="Espera após salvar (s):").pack(side="left")
-        self.spn_espera_salvar = ttk.Spinbox(
-            barra_robo, from_=0.2, to=15.0, increment=0.1, width=6,
-            textvariable=self.var_espera_salvar, font=("Segoe UI", 10))
-        self.spn_espera_salvar.pack(side="left", padx=(4, 16))
-
-        ttk.Label(barra_robo, text="Tecla para gravar:").pack(side="left")
-        self.cmb_tecla_gravar = ttk.Combobox(
-            barra_robo, textvariable=self.var_tecla_gravar,
-            values=("ENTER", "F2"), state="readonly", width=8,
-            font=("Segoe UI", 10))
-        self.cmb_tecla_gravar.pack(side="left", padx=(4, 12))
-
-        self.btn_digitar = ttk.Button(
-            barra_robo, text=f"⌨️ Digitar no WK Radar ({CONTAGEM_SEGUNDOS}s)",
-            command=self.iniciar_digitacao)
-        self.btn_digitar_sel = ttk.Button(
-            barra_robo, text=f"▶️ Da Linha Selecionada ({CONTAGEM_SEGUNDOS}s)",
-            command=self.iniciar_digitacao_da_selecionada)
-        self.btn_digitar.pack(side="right", padx=(6, 0))
-        self.btn_digitar_sel.pack(side="right", padx=6)
-
         # --- dica de edição e atalhos
         ttk.Label(
             self.root,
             text=("Duplo clique na linha: editar campos (Código, Valor Unit., Destino, Qtd Final)  •  "
                   "Atalhos globais na digitação: F12 = Pausar/Retomar  |  Esc = Parar  |  "
                   "Mouse no canto sup. esq. = Abortar"),
-            foreground="#005fb8", padding=(10, 0),
+            foreground="#005fb8", padding=(10, 2, 10, 0),
         ).pack(fill="x")
 
         # --- tabela central
@@ -452,11 +443,12 @@ class App:
         self.tree.column("destino", width=75, anchor="center")
         self.tree.column("qtd", width=85, anchor="center")
         self.tree.column("manual", width=130, anchor="center")
-        self.tree.column("obs", width=430, anchor="w")
-        self.tree.column("status", width=115, anchor="center")
+        self.tree.column("obs", width=355, anchor="w")
+        self.tree.column("status", width=190, anchor="center")
 
         self.tree.tag_configure("alterado", background=COR_ALTERADO)
-        self.tree.tag_configure("digitado", background=COR_DIGITADO)
+        self.tree.tag_configure("lancado", background=COR_LANCADO)
+        self.tree.tag_configure("popup", background=COR_POPUP)
 
         scroll = ttk.Scrollbar(meio, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -475,9 +467,9 @@ class App:
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="▶️ Digitar a partir desta linha",
                               command=self.iniciar_digitacao_da_selecionada)
-        self.menu.add_command(label="✅ Marcar / desmarcar como digitado",
+        self.menu.add_command(label="✅ Marcar / desmarcar como lançado",
                               command=self.alternar_digitado_selecionados)
-        self.menu.add_command(label="🔄 Desmarcar todos os digitados",
+        self.menu.add_command(label="🔄 Desmarcar todos os lançados",
                               command=self.desmarcar_todos_digitados)
         self.menu.add_separator()
         self.menu.add_command(label="📝 Editar item completo (Código, Valor, Destino, Qtd)...",
@@ -498,7 +490,55 @@ class App:
 
         self._editor = None  # caixinha de edição direta na célula
 
-        # --- rodapé com instrução fixa do campo OPERAÇÃO + status
+        # --- painel inferior: calibração + botões de iniciar/pausar/parar
+        barra_robo = ttk.LabelFrame(
+            self.root, text="Calibração e Digitação (Inclusão — WK Radar)",
+            padding=(10, 6, 10, 8))
+        barra_robo.pack(fill="x", padx=10, pady=(2, 4))
+
+        linha_cal = ttk.Frame(barra_robo)
+        linha_cal.pack(fill="x", pady=(0, 6))
+
+        ttk.Label(linha_cal, text="Setas p/ baixo (Operação):").pack(side="left")
+        self.spn_setas_operacao = ttk.Spinbox(
+            linha_cal, from_=0, to=20, increment=1, width=5,
+            textvariable=self.var_setas_operacao, font=("Segoe UI", 10))
+        self.spn_setas_operacao.pack(side="left", padx=(4, 18))
+
+        ttk.Label(linha_cal, text="Enters após Quantidade (até OK):").pack(side="left")
+        self.spn_enters_apos_qtd = ttk.Spinbox(
+            linha_cal, from_=1, to=50, increment=1, width=5,
+            textvariable=self.var_enters_apos_qtd, font=("Segoe UI", 10))
+        self.spn_enters_apos_qtd.pack(side="left", padx=(4, 18))
+
+        ttk.Label(linha_cal, text="Espera após OK (s):").pack(side="left")
+        self.spn_espera_apos_ok = ttk.Spinbox(
+            linha_cal, from_=0.2, to=15.0, increment=0.1, width=6,
+            textvariable=self.var_espera_apos_ok, font=("Segoe UI", 10))
+        self.spn_espera_apos_ok.pack(side="left", padx=(4, 4))
+
+        linha_acoes = ttk.Frame(barra_robo)
+        linha_acoes.pack(fill="x")
+
+        self.btn_pausar = ttk.Button(
+            linha_acoes, text="⏸️ Pausar (F12)",
+            command=lambda: self.alternar_pausa(via_atalho=False), state="disabled")
+        self.btn_parar = ttk.Button(
+            linha_acoes, text="⏹️ Parar (Esc)",
+            command=self.parar_digitacao, state="disabled")
+        self.btn_pausar.pack(side="left", padx=(0, 6))
+        self.btn_parar.pack(side="left", padx=6)
+
+        self.btn_digitar = ttk.Button(
+            linha_acoes, text=f"⌨️ Digitar no WK Radar ({CONTAGEM_SEGUNDOS}s)",
+            command=self.iniciar_digitacao)
+        self.btn_digitar_sel = ttk.Button(
+            linha_acoes, text=f"▶️ Da Linha Selecionada ({CONTAGEM_SEGUNDOS}s)",
+            command=self.iniciar_digitacao_da_selecionada)
+        self.btn_digitar.pack(side="right", padx=(6, 0))
+        self.btn_digitar_sel.pack(side="right", padx=6)
+
+        # --- rodapé com instrução fixa do campo DATA + status
         rodape = ttk.Frame(self.root, padding=(10, 2, 10, 10))
         rodape.pack(fill="x")
 
@@ -512,6 +552,17 @@ class App:
             anchor="w",
         ).pack(fill="x")
 
+        linha_retomada = ttk.Frame(rodape)
+        linha_retomada.pack(fill="x", pady=(0, 6))
+        self.btn_continuar_proxima = ttk.Button(
+            linha_retomada, text="▶ Continuar da Próxima Peça",
+            command=self.continuar_proxima_peca, state="disabled")
+        self.btn_repetir_pausada = ttk.Button(
+            linha_retomada, text="🔁 Repetir Peça Pausada",
+            command=self.repetir_peca_pausada, state="disabled")
+        self.btn_continuar_proxima.pack(side="left", padx=(0, 8))
+        self.btn_repetir_pausada.pack(side="left")
+
         linha_status = ttk.Frame(rodape)
         linha_status.pack(fill="x")
         self.var_status = tk.StringVar(value=INSTRUCAO_RODAPE)
@@ -523,6 +574,15 @@ class App:
     # ----------------------------------------------------------------- helpers
     def _set_status(self, texto: str):
         self.var_status.set(texto)
+
+    def _definir_botoes_retomada(self, habilitar: bool):
+        estado = "normal" if habilitar else "disabled"
+        self.btn_continuar_proxima.configure(state=estado)
+        self.btn_repetir_pausada.configure(state=estado)
+
+    def _limpar_estado_popup(self):
+        self.idx_pausado_popup = None
+        self._definir_botoes_retomada(False)
 
     def _set_ocupado(self, ocupado: bool, modo: str = ""):
         self.ocupado = ocupado
@@ -541,6 +601,13 @@ class App:
         )
         self.btn_parar.configure(state="normal" if em_digitacao else "disabled")
 
+        pode_retomar_popup = (
+            not ocupado
+            and self.idx_pausado_popup is not None
+            and 0 <= self.idx_pausado_popup < len(self.itens)
+        )
+        self._definir_botoes_retomada(pode_retomar_popup)
+
     def _ler_setas_operacao(self) -> int:
         try:
             valor = int(self.var_setas_operacao.get().strip())
@@ -549,28 +616,36 @@ class App:
             self.var_setas_operacao.set(str(SETAS_OPERACAO_PADRAO))
             return SETAS_OPERACAO_PADRAO
 
-    def _ler_espera_salvar(self) -> float:
+    def _ler_enters_apos_qtd(self) -> int:
         try:
-            valor = float(self.var_espera_salvar.get().strip().replace(",", "."))
+            valor = int(self.var_enters_apos_qtd.get().strip())
+            return max(1, min(valor, 50))
+        except ValueError:
+            self.var_enters_apos_qtd.set(str(ENTERS_APOS_QTD_PADRAO))
+            return ENTERS_APOS_QTD_PADRAO
+
+    def _ler_espera_apos_ok(self) -> float:
+        try:
+            valor = float(self.var_espera_apos_ok.get().strip().replace(",", "."))
             return max(0.1, min(valor, 30.0))
         except ValueError:
-            self.var_espera_salvar.set(f"{ESPERA_APOS_SALVAR:.1f}")
-            return ESPERA_APOS_SALVAR
-
-    def _tecla_gravar_pyautogui(self) -> str:
-        escolha = self.var_tecla_gravar.get().strip().upper()
-        return "f2" if escolha == "F2" else "enter"
+            self.var_espera_apos_ok.set(f"{ESPERA_APOS_OK:.1f}")
+            return ESPERA_APOS_OK
 
     def _status_item_texto(self, item: ItemCorte) -> str:
-        if item.digitado:
-            return "✅ Digitado"
+        if item.erro_popup:
+            return "⚠️ Falta de material / Pop-up"
+        if item.lancado:
+            return "✅ Resolvida manual" if item.resolvida_manual else "✅ Lançado"
         if item.quantidade_final <= 0:
             return "⚪ Ignorado (0)"
         return "⏳ Pendente"
 
     def _tags_item(self, item: ItemCorte) -> tuple[str, ...]:
-        if item.digitado:
-            return ("digitado",)
+        if item.erro_popup:
+            return ("popup",)
+        if item.lancado:
+            return ("lancado",)
         if item.alterado_a_mao:
             return ("alterado",)
         return ()
@@ -596,25 +671,41 @@ class App:
 
     def _atualizar_resumo(self):
         n_alt = sum(1 for it in self.itens if it.alterado_a_mao)
-        n_dig = sum(1 for it in self.itens if it.digitado)
+        n_lanc = sum(1 for it in self.itens if it.lancado)
         soma_pecas = sum(max(0, it.quantidade_final) for it in self.itens)
         self.var_total.set(
             f"{len(self.itens)} itens ({soma_pecas} peças)  •  "
-            f"{n_alt} manual  •  {n_dig} digitados (✅)"
+            f"{n_alt} manual  •  {n_lanc} lançados (✅)"
         )
 
-    def _marcar_digitado(self, idx: int, valor: bool = True):
+    def _atualizar_linha_tabela(self, idx: int):
+        item = self.itens[idx]
+        iid = str(idx)
+        if iid in self.tree.get_children():
+            self.tree.item(iid, tags=self._tags_item(item),
+                           values=self._valores_linha(item))
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.see(iid)
+        self._atualizar_resumo()
+
+    def _marcar_lancado(self, idx: int, valor: bool = True, resolvida_manual: bool = False):
         if 0 <= idx < len(self.itens):
-            item = self.itens[idx].model_copy(update={"digitado": valor})
-            self.itens[idx] = item
-            iid = str(idx)
-            if iid in self.tree.get_children():
-                self.tree.item(iid, tags=self._tags_item(item),
-                               values=self._valores_linha(item))
-                self.tree.selection_set(iid)
-                self.tree.focus(iid)
-                self.tree.see(iid)
-            self._atualizar_resumo()
+            self.itens[idx] = self.itens[idx].model_copy(update={
+                "lancado": valor,
+                "erro_popup": False,
+                "resolvida_manual": resolvida_manual if valor else False,
+            })
+            self._atualizar_linha_tabela(idx)
+
+    def _marcar_popup_item(self, idx: int):
+        if 0 <= idx < len(self.itens):
+            self.itens[idx] = self.itens[idx].model_copy(update={
+                "lancado": False,
+                "erro_popup": True,
+                "resolvida_manual": False,
+            })
+            self._atualizar_linha_tabela(idx)
 
     def alternar_digitado_selecionados(self):
         if self.ocupado:
@@ -626,9 +717,13 @@ class App:
                 sel = [int(iid)]
         if not sel:
             return
-        novo_estado = not all(self.itens[idx].digitado for idx in sel)
+        novo_estado = not all(self.itens[idx].lancado for idx in sel)
         for idx in sel:
-            self.itens[idx] = self.itens[idx].model_copy(update={"digitado": novo_estado})
+            self.itens[idx] = self.itens[idx].model_copy(update={
+                "lancado": novo_estado,
+                "erro_popup": False,
+                "resolvida_manual": False,
+            })
         self.atualizar_tabela()
         for idx in sel:
             self.tree.selection_add(str(idx))
@@ -636,12 +731,20 @@ class App:
     def desmarcar_todos_digitados(self):
         if self.ocupado or not self.itens:
             return
-        if not any(it.digitado for it in self.itens):
-            self._set_status("Nenhum item está marcado como digitado.")
+        self._limpar_estado_popup()
+        if not any(it.lancado or it.erro_popup for it in self.itens):
+            self._set_status("Nenhum item está marcado como lançado.")
             return
-        self.itens = [it.model_copy(update={"digitado": False}) for it in self.itens]
+        self.itens = [
+            it.model_copy(update={
+                "lancado": False,
+                "erro_popup": False,
+                "resolvida_manual": False,
+            })
+            for it in self.itens
+        ]
         self.atualizar_tabela()
-        self._set_status("🔄 Marcações de digitado (✅) limpas.")
+        self._set_status("🔄 Marcações de lançado (✅) limpas.")
 
     # --------------------------------------------------------------- leitura
     def abrir_fotos(self):
@@ -721,6 +824,7 @@ class App:
         if acumular:
             self.itens.extend(novos)
         else:
+            self._limpar_estado_popup()
             self.itens = list(novos)
         self.atualizar_tabela()
         self._set_ocupado(False)
@@ -743,6 +847,7 @@ class App:
             return
         if messagebox.askyesno("Limpar Lista", "Apagar todos os itens da lista?"):
             self.itens.clear()
+            self._limpar_estado_popup()
             self.atualizar_tabela()
             self._set_status("Lista limpa. Pronto para um novo lote.")
 
@@ -752,9 +857,15 @@ class App:
         selecionados = sorted((int(i) for i in self.tree.selection()), reverse=True)
         if not selecionados:
             return
+        if self.idx_pausado_popup is not None:
+            if self.idx_pausado_popup in selecionados:
+                self._limpar_estado_popup()
+            else:
+                self.idx_pausado_popup -= sum(1 for i in selecionados if i < self.idx_pausado_popup)
         for idx in selecionados:
             del self.itens[idx]
         self.atualizar_tabela()
+        self._set_ocupado(False)
         self._set_status(f"{len(selecionados)} linha(s) removida(s).")
 
     # ------------------------------------------------- edição direta e diálogo
@@ -775,9 +886,9 @@ class App:
         coluna = self.tree.identify_column(event.x)
         if not iid:
             return
-        if coluna == "#7":                  # Status: alterna ✅ Digitado
+        if coluna == "#7":                  # Status: alterna ✅ Lançado
             idx = int(iid)
-            self._marcar_digitado(idx, not self.itens[idx].digitado)
+            self._marcar_lancado(idx, not self.itens[idx].lancado)
         else:
             # Abre a janela de edição completa focando o campo clicado
             self._abrir_dialogo(iid, coluna_foco=coluna)
@@ -982,7 +1093,7 @@ class App:
         var_qtd = tk.StringVar(value=str(item.quantidade_final))
         var_alt = tk.BooleanVar(value=item.alterado_a_mao)
         var_obs = tk.StringVar(value=item.observacao)
-        var_dig = tk.BooleanVar(value=item.digitado)
+        var_dig = tk.BooleanVar(value=item.lancado)
 
         ttk.Label(frm, text="Código (Produto):").grid(row=0, column=0, sticky="w", pady=4)
         ent_cod = ttk.Entry(frm, textvariable=var_cod, width=42)
@@ -1007,7 +1118,7 @@ class App:
         ent_obs = ttk.Entry(frm, textvariable=var_obs, width=42)
         ent_obs.grid(row=5, column=1, pady=4, sticky="w")
 
-        ttk.Checkbutton(frm, text="Já digitado no WK Radar (✅)",
+        ttk.Checkbutton(frm, text="Já lançado no WK Radar (✅)",
                         variable=var_dig).grid(row=6, column=1, sticky="w", pady=4)
 
         def salvar(_e=None):
@@ -1026,6 +1137,7 @@ class App:
                 return
             valor_unit = var_val.get().strip() or VALOR_UNITARIO_PADRAO
             destino = var_dst.get().strip() or LOCAL_DESTINO_PADRAO
+            marcado_lancado = var_dig.get()
             novo = ItemCorte(
                 codigo=codigo,
                 valor_unitario=valor_unit,
@@ -1033,7 +1145,9 @@ class App:
                 quantidade_final=qtd,
                 alterado_a_mao=var_alt.get(),
                 observacao=var_obs.get().strip(),
-                digitado=var_dig.get(),
+                lancado=marcado_lancado,
+                erro_popup=False,
+                resolvida_manual=item.resolvida_manual if marcado_lancado else False,
             )
             janela.destroy()
             self._registrar_correcao(idx, item, novo)
@@ -1105,7 +1219,7 @@ class App:
 
     # ------------------------------------------------------------ digitação
     def iniciar_digitacao(self):
-        """Digita todos os itens pendentes (não marcados com ✅ e com qtd > 0)."""
+        """Digita todos os itens pendentes (não lançados com ✅ e com qtd > 0)."""
         if self.ocupado:
             return
         self._fechar_editor(salvar=True)
@@ -1115,11 +1229,11 @@ class App:
                                    "Não há itens com quantidade maior que zero.")
             return
 
-        pendentes = [(idx, it) for idx, it in com_qtd if not it.digitado]
+        pendentes = [(idx, it) for idx, it in com_qtd if not it.lancado]
         if not pendentes:
             if not messagebox.askyesno(
-                "Tudo já digitado",
-                "Todos os itens já estão marcados como digitados (✅).\n\n"
+                "Tudo já lançado",
+                "Todos os itens já estão marcados como lançados (✅).\n\n"
                 "Deseja desmarcar todos e digitar tudo novamente?",
             ):
                 return
@@ -1153,6 +1267,7 @@ class App:
         self._iniciar_fila_digitacao(fila)
 
     def _iniciar_fila_digitacao(self, fila: list[tuple[int, ItemCorte]]):
+        self._limpar_estado_popup()
         self.digitando = True
         self.pausado = False
         self.parar_solicitado = False
@@ -1174,24 +1289,25 @@ class App:
             return
         if restante > 0:
             self._set_status(
-                f"⏱️ Iniciando em {restante}s... Clique no campo OPERAÇÃO no WK Radar "
-                "e deixe o mouse parado sobre ele!"
+                f"⏱️ Iniciando em {restante}s... Clique no campo DATA (início do formulário) "
+                "no WK Radar e deixe o mouse parado ali!"
             )
             self.root.after(1000, self._contagem, restante - 1, fila)
             return
 
-        # Fim dos 10 segundos: captura a posição do mouse sobre o campo OPERAÇÃO
-        pos_operacao = pyautogui.position()
+        # Fim dos 10 segundos: captura a posição do mouse e a janela principal do WK Radar
+        pos_inicio = pyautogui.position()
+        hwnd_wk = obter_hwnd_ativo()
         setas_operacao = self._ler_setas_operacao()
-        espera_salvar = self._ler_espera_salvar()
-        tecla_gravar = self._tecla_gravar_pyautogui()
+        enters_apos_qtd = self._ler_enters_apos_qtd()
+        espera_apos_ok = self._ler_espera_apos_ok()
         self._set_status(
-            f"⌨️ Digitando no WK Radar (Operação em {pos_operacao.x}, {pos_operacao.y})... "
+            f"⌨️ Digitando no WK Radar (Data em {pos_inicio.x}, {pos_inicio.y})... "
             "[F12 pausa • Esc para]"
         )
         threading.Thread(
             target=self._digitar,
-            args=(fila, pos_operacao, setas_operacao, espera_salvar, tecla_gravar),
+            args=(fila, pos_inicio, hwnd_wk, setas_operacao, enters_apos_qtd, espera_apos_ok),
             daemon=True,
         ).start()
 
@@ -1214,10 +1330,22 @@ class App:
         return self._aguardar_pausa_ou_parada()
 
     def _digitar(self, fila: list[tuple[int, ItemCorte]],
-                 pos_operacao, setas_operacao: int,
-                 espera_salvar: float, tecla_gravar: str):
+                 pos_inicio, hwnd_wk: int, setas_operacao: int,
+                 enters_apos_qtd: int, espera_apos_ok: float):
         total = len(fila)
         digitados_agora = 0
+
+        def checar_popup(idx_atual: int, codigo_atual: str) -> bool:
+            if verificar_popup(hwnd_wk):
+                titulo_popup = obter_titulo_janela(obter_hwnd_ativo())
+                try:
+                    winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                except Exception:
+                    pass
+                self.root.after(0, self._pausar_por_popup, idx_atual, codigo_atual, titulo_popup)
+                return True
+            return False
+
         try:
             for pos, (idx, item) in enumerate(fila, start=1):
                 if item.quantidade_final <= 0:
@@ -1225,7 +1353,7 @@ class App:
                 if self._aguardar_pausa_ou_parada():
                     self.root.after(
                         0, self._fim_digitacao,
-                        f"🛑 Digitação parada pelo usuário ({digitados_agora}/{total} digitados)."
+                        f"🛑 Digitação parada pelo usuário ({digitados_agora}/{total} lançados)."
                     )
                     return
 
@@ -1235,14 +1363,25 @@ class App:
                     f"(qtd {item.quantidade_final})  [F12 pausa • Esc para]"
                 )
 
-                # 1. Clicar em pos_operacao para abrir a lista de opções e aguardar 0.3s
-                pyautogui.click(pos_operacao)
+                # 1. Voltar ao início (Data)
+                if checar_popup(idx, item.codigo):
+                    return
+                pyautogui.click(pos_inicio)
                 if self._dormir_interrompivel(0.3):
                     break
 
-                # 2. Pressionar 'down' o número de vezes de Setas p/ baixo (Operação) (0.1s cada)
+                # 2. 1º Enter (vai para Operação)
+                if checar_popup(idx, item.codigo):
+                    return
+                pyautogui.press("enter")
+                if self._dormir_interrompivel(0.25):
+                    break
+
+                # 3. Selecionar "Entrada da Produção" (sem digitar texto)
                 parou_nas_setas = False
                 for _ in range(setas_operacao):
+                    if checar_popup(idx, item.codigo):
+                        return
                     pyautogui.press("down")
                     if self._dormir_interrompivel(0.1):
                         parou_nas_setas = True
@@ -1250,73 +1389,112 @@ class App:
                 if parou_nas_setas:
                     break
 
-                # 3. Confirmar "Entrada da Produção" (Enter), aguardar 0.3s e pular Cód. Barras (Enter)
+                # 4. 2º Enter (vai para Produto)
+                if checar_popup(idx, item.codigo):
+                    return
                 pyautogui.press("enter")
-                if self._dormir_interrompivel(0.3):
+                if self._dormir_interrompivel(0.25):
                     break
-                pyautogui.press("enter")
 
-                # 4. Preencher Produto
+                # 5. Preencher Código
+                if checar_popup(idx, item.codigo):
+                    return
                 pyperclip.copy(item.codigo)
                 pyautogui.hotkey("ctrl", "v")
-                pyautogui.press("enter")
-                if self._dormir_interrompivel(0.5):
+                if self._dormir_interrompivel(0.2):
                     break
 
-                # 5. Pular "Tipo de Estoque" (Estoque Próprio)
+                # 6. 3º Enter (sai de Produto -> passa por Tipo de Estoque)
+                if checar_popup(idx, item.codigo):
+                    return
                 pyautogui.press("enter")
-                if self._dormir_interrompivel(0.3):
+                if self._dormir_interrompivel(0.6):
                     break
 
-                # 6. Preencher Valor Unitário
+                # 7. 4º Enter (vai para Valor Unitário)
+                if checar_popup(idx, item.codigo):
+                    return
+                pyautogui.press("enter")
+                if self._dormir_interrompivel(0.25):
+                    break
+
+                # 8. Preencher Valor Unitário
+                if checar_popup(idx, item.codigo):
+                    return
                 pyperclip.copy(item.valor_unitario or VALOR_UNITARIO_PADRAO)
                 pyautogui.hotkey("ctrl", "v")
-                pyautogui.press("enter")
-                if self._dormir_interrompivel(0.4):
+                if self._dormir_interrompivel(0.2):
                     break
 
-                # 7. Pular "Local de Origem"
+                # 9. 5º Enter (vai para Local de Destino)
+                if checar_popup(idx, item.codigo):
+                    return
                 pyautogui.press("enter")
-                if self._dormir_interrompivel(0.3):
+                if self._dormir_interrompivel(0.25):
                     break
 
-                # 8. Preencher Local de Destino
+                # 10. Preencher Local de Destino
+                if checar_popup(idx, item.codigo):
+                    return
                 pyautogui.write(str(item.local_destino or LOCAL_DESTINO_PADRAO))
-                pyautogui.press("enter")
-                if self._dormir_interrompivel(0.4):
+                if self._dormir_interrompivel(0.2):
                     break
 
-                # 9. Pular "Mov. Origem"
+                # 11. 6º Enter (vai para Quantidade)
+                if checar_popup(idx, item.codigo):
+                    return
                 pyautogui.press("enter")
-                if self._dormir_interrompivel(0.3):
+                if self._dormir_interrompivel(0.25):
                     break
 
-                # 10. Preencher Quantidade
+                # 12. Preencher Quantidade
+                if checar_popup(idx, item.codigo):
+                    return
                 pyperclip.copy(str(item.quantidade_final))
                 pyautogui.hotkey("ctrl", "v")
-                pyautogui.press("enter")
-                if self._dormir_interrompivel(0.5):
+                if self._dormir_interrompivel(0.2):
                     break
 
-                # 11. Gravar e aguardar atualização do WK Radar
-                pyautogui.press(tecla_gravar)
+                # 13. Enters finais (do 7º até o 23º + confirmação do OK)
+                parou_nos_enters = False
+                for _ in range(enters_apos_qtd):
+                    if checar_popup(idx, item.codigo):
+                        return
+                    pyautogui.press("enter")
+                    if self._dormir_interrompivel(0.12):
+                        parou_nos_enters = True
+                        break
+                if parou_nos_enters:
+                    break
+
+                # 14. Monitoramento ativo pós-OK (checa pop-up a cada 0.1s durante espera_apos_ok)
+                restante_ok = espera_apos_ok
+                while restante_ok > 0:
+                    if self._aguardar_pausa_ou_parada():
+                        break
+                    if checar_popup(idx, item.codigo):
+                        return
+                    passo_ok = min(0.1, restante_ok)
+                    time.sleep(passo_ok)
+                    restante_ok -= passo_ok
+                if self.parar_solicitado:
+                    break
+                if checar_popup(idx, item.codigo):
+                    return
 
                 digitados_agora += 1
-                self.root.after(0, self._marcar_digitado, idx, True)
-
-                if self._dormir_interrompivel(espera_salvar):
-                    break
+                self.root.after(0, self._marcar_lancado, idx, True, False)
 
             if self.parar_solicitado:
                 self.root.after(
                     0, self._fim_digitacao,
-                    f"🛑 Digitação parada pelo usuário ({digitados_agora}/{total} digitados)."
+                    f"🛑 Digitação parada pelo usuário ({digitados_agora}/{total} lançados)."
                 )
                 return
         except pyautogui.FailSafeException:
             self.root.after(
                 0, self._fim_digitacao,
-                f"🛑 Digitação abortada pelo mouse no canto ({digitados_agora}/{total} digitados)."
+                f"🛑 Digitação abortada pelo mouse no canto ({digitados_agora}/{total} lançados)."
             )
             return
         except Exception as e:
@@ -1324,8 +1502,64 @@ class App:
             return
         self.root.after(
             0, self._fim_digitacao,
-            f"✅ Concluído! {digitados_agora} itens gravados no WK Radar."
+            f"✅ Concluído! {digitados_agora} itens lançados no WK Radar."
         )
+
+    def _pausar_por_popup(self, idx: int, codigo: str, titulo_popup: str):
+        self.digitando = False
+        self.pausado = False
+        self.parar_solicitado = False
+        self.idx_pausado_popup = idx
+        self._marcar_popup_item(idx)
+        self._set_ocupado(False)
+        self._set_status(
+            f"⚠️ PAUSADO POR POP-UP na peça '{codigo}' — Janela: {titulo_popup}"
+        )
+        try:
+            self.root.deiconify()
+            self.root.lift()
+        except tk.TclError:
+            pass
+
+    def continuar_proxima_peca(self):
+        """Marca a peça pausada como resolvida manualmente e retoma pela próxima."""
+        if self.ocupado or self.idx_pausado_popup is None:
+            return
+        if not (0 <= self.idx_pausado_popup < len(self.itens)):
+            self._limpar_estado_popup()
+            return
+        idx_pausado = self.idx_pausado_popup
+        self._marcar_lancado(idx_pausado, True, resolvida_manual=True)
+        self._limpar_estado_popup()
+        fila = [
+            (i, self.itens[i])
+            for i in range(idx_pausado + 1, len(self.itens))
+            if self.itens[i].quantidade_final > 0 and not self.itens[i].lancado
+        ]
+        if not fila:
+            self._set_status("✅ Peça marcada como resolvida manual. Não há mais peças pendentes.")
+            return
+        self._iniciar_fila_digitacao(fila)
+
+    def repetir_peca_pausada(self):
+        """Retoma a digitação começando novamente pela peça onde ocorreu o pop-up."""
+        if self.ocupado or self.idx_pausado_popup is None:
+            return
+        if not (0 <= self.idx_pausado_popup < len(self.itens)):
+            self._limpar_estado_popup()
+            return
+        idx_pausado = self.idx_pausado_popup
+        self._marcar_lancado(idx_pausado, False, resolvida_manual=False)
+        self._limpar_estado_popup()
+        fila = [
+            (i, self.itens[i])
+            for i in range(idx_pausado, len(self.itens))
+            if self.itens[i].quantidade_final > 0 and not self.itens[i].lancado
+        ]
+        if not fila:
+            self._set_status("Não há peças pendentes a partir da linha pausada.")
+            return
+        self._iniciar_fila_digitacao(fila)
 
     def _fim_digitacao(self, mensagem: str):
         self.digitando = False
