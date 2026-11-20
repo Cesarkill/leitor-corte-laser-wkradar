@@ -1389,7 +1389,7 @@ class App:
                             break
                 if parou_nas_setas:
                     break
-                if setas_operacao > 0 and self._dormir_interrompivel(0.35):
+                if setas_operacao > 0 and self._dormir_interrompivel(1.0):
                     break
 
                 # 4. 2º Enter (entra no campo novo criado pela operação)
@@ -1405,6 +1405,14 @@ class App:
                 pyautogui.press("enter")
                 if self._dormir_interrompivel(0.25):
                     break
+
+                # 5b. Enter extra antes de Produto somente a partir do 2º loop
+                if digitados_agora >= 1:
+                    if checar_popup(idx, item.codigo):
+                        return
+                    pyautogui.press("enter")
+                    if self._dormir_interrompivel(0.25):
+                        break
 
                 # 6. Preencher Código
                 if checar_popup(idx, item.codigo):
