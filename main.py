@@ -1426,28 +1426,21 @@ class App:
                 if self._dormir_interrompivel(0.2):
                     break
 
-                # 9. 5º Enter (vai para Local de Destino)
+                # 9. 5º Enter (vai para Local de Destino — preenchido automaticamente pelo WK Radar)
                 if checar_popup(idx, item.codigo):
                     return
                 pyautogui.press("enter")
                 if self._dormir_interrompivel(0.25):
                     break
 
-                # 10. Preencher Local de Destino
-                if checar_popup(idx, item.codigo):
-                    return
-                pyautogui.write(str(item.local_destino or LOCAL_DESTINO_PADRAO))
-                if self._dormir_interrompivel(0.2):
-                    break
-
-                # 11. 6º Enter (vai para Quantidade)
+                # 10. 6º Enter (pula Local de Destino e vai para Quantidade)
                 if checar_popup(idx, item.codigo):
                     return
                 pyautogui.press("enter")
                 if self._dormir_interrompivel(0.25):
                     break
 
-                # 12. Preencher Quantidade
+                # 11. Preencher Quantidade
                 if checar_popup(idx, item.codigo):
                     return
                 pyperclip.copy(str(item.quantidade_final))
