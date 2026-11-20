@@ -39,8 +39,8 @@ MODELOS_RESERVA = ["gemini-4-hydrogen", "gemini-3.8-flash"]
 TEMPO_LIMITE_IA = 60
 
 CONTAGEM_SEGUNDOS = 10          # contagem regressiva antes de começar a digitar
-SETAS_OPERACAO_PADRAO = 3       # toques na seta p/ baixo no campo Operação
-ENTERS_APOS_QTD_PADRAO = 18     # 17 Enters até o botão OK + 1 Enter para confirmar
+SETAS_OPERACAO_PADRAO = 1       # toques na seta p/ baixo no campo Operação
+ENTERS_APOS_QTD_PADRAO = 18     # 17 Enters do 7º ao 24º no botão OK + 1 Enter para confirmar
 ESPERA_APOS_OK = 1.5            # tempo (s) para salvar e limpar o formulário
 VALOR_UNITARIO_PADRAO = "0,00"
 LOCAL_DESTINO_PADRAO = "23"
@@ -1377,26 +1377,36 @@ class App:
                 if self._dormir_interrompivel(0.25):
                     break
 
-                # 3. Selecionar "Entrada da Produção" (sem digitar texto)
+                # 3. Selecionar "Entrada da Produção" (sem digitar texto) e aguardar campo dinâmico
                 parou_nas_setas = False
-                for _ in range(setas_operacao):
+                for s in range(setas_operacao):
                     if checar_popup(idx, item.codigo):
                         return
                     pyautogui.press("down")
-                    if self._dormir_interrompivel(0.1):
-                        parou_nas_setas = True
-                        break
+                    if s < setas_operacao - 1:
+                        if self._dormir_interrompivel(0.1):
+                            parou_nas_setas = True
+                            break
                 if parou_nas_setas:
                     break
+                if setas_operacao > 0 and self._dormir_interrompivel(0.35):
+                    break
 
-                # 4. 2º Enter (vai para Produto)
+                # 4. 2º Enter (entra no campo novo criado pela operação)
                 if checar_popup(idx, item.codigo):
                     return
                 pyautogui.press("enter")
                 if self._dormir_interrompivel(0.25):
                     break
 
-                # 5. Preencher Código
+                # 5. 3º Enter (sai do campo novo e vai para Produto)
+                if checar_popup(idx, item.codigo):
+                    return
+                pyautogui.press("enter")
+                if self._dormir_interrompivel(0.25):
+                    break
+
+                # 6. Preencher Código
                 if checar_popup(idx, item.codigo):
                     return
                 pyperclip.copy(item.codigo)
@@ -1404,21 +1414,21 @@ class App:
                 if self._dormir_interrompivel(0.2):
                     break
 
-                # 6. 3º Enter (sai de Produto -> passa por Tipo de Estoque)
+                # 7. 4º Enter (sai de Produto / passa por Tipo de Estoque)
                 if checar_popup(idx, item.codigo):
                     return
                 pyautogui.press("enter")
                 if self._dormir_interrompivel(0.6):
                     break
 
-                # 7. 4º Enter (vai para Valor Unitário)
+                # 8. 5º Enter (vai para Valor Unitário)
                 if checar_popup(idx, item.codigo):
                     return
                 pyautogui.press("enter")
                 if self._dormir_interrompivel(0.25):
                     break
 
-                # 8. Preencher Valor Unitário
+                # 9. Preencher Valor Unitário
                 if checar_popup(idx, item.codigo):
                     return
                 pyperclip.copy(item.valor_unitario or VALOR_UNITARIO_PADRAO)
@@ -1426,21 +1436,28 @@ class App:
                 if self._dormir_interrompivel(0.2):
                     break
 
-                # 9. 5º Enter (vai para Local de Destino — preenchido automaticamente pelo WK Radar)
+                # 10. 6º Enter (vai para Local de Destino — aguarda 1.5s para o WK Radar processar)
+                if checar_popup(idx, item.codigo):
+                    return
+                pyautogui.press("enter")
+                if self._dormir_interrompivel(1.5):
+                    break
+
+                # 11. 7º Enter (sai de Local de Destino / campo intermediário)
                 if checar_popup(idx, item.codigo):
                     return
                 pyautogui.press("enter")
                 if self._dormir_interrompivel(0.25):
                     break
 
-                # 10. 6º Enter (pula Local de Destino e vai para Quantidade)
+                # 12. 8º Enter (vai para Quantidade)
                 if checar_popup(idx, item.codigo):
                     return
                 pyautogui.press("enter")
                 if self._dormir_interrompivel(0.25):
                     break
 
-                # 11. Preencher Quantidade
+                # 13. Preencher Quantidade
                 if checar_popup(idx, item.codigo):
                     return
                 pyperclip.copy(str(item.quantidade_final))
@@ -1448,7 +1465,7 @@ class App:
                 if self._dormir_interrompivel(0.2):
                     break
 
-                # 13. Enters finais (do 7º até o 23º + confirmação do OK)
+                # 13. Enters finais (do 8º ao 24º Enter + confirmação do OK)
                 parou_nos_enters = False
                 for _ in range(enters_apos_qtd):
                     if checar_popup(idx, item.codigo):
@@ -1460,7 +1477,7 @@ class App:
                 if parou_nos_enters:
                     break
 
-                # 14. Monitoramento ativo pós-OK (checa pop-up a cada 0.1s durante espera_apos_ok)
+                # 15. Monitoramento ativo pós-OK (checa pop-up a cada 0.1s durante espera_apos_ok)
                 restante_ok = espera_apos_ok
                 while restante_ok > 0:
                     if self._aguardar_pausa_ou_parada():
