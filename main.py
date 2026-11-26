@@ -10,7 +10,9 @@ Entrada da Produção do ERP WK Radar.
 import base64
 import ctypes
 import io
+import json
 import os
+import re
 import sys
 import threading
 import time
@@ -23,7 +25,7 @@ import pyperclip
 from dotenv import load_dotenv
 from google import genai
 from PIL import Image, ImageGrab, ImageOps
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic.json_schema import SkipJsonSchema
 
 # =============================================================================
@@ -41,6 +43,7 @@ TEMPO_LIMITE_IA = 60
 CONTAGEM_SEGUNDOS = 10          # tempo total da calibração (5s + 5s)
 CONTAGEM_ETAPA_SEGUNDOS = 5     # segundos por etapa (1/2 Operação, 2/2 Produto)
 SETAS_OPERACAO_PADRAO = 1       # toques na seta p/ baixo no campo Operação
+ESPERA_APOS_PRODUTO = 1.0       # tempo (s) após Enter do Produto p/ consulta no banco
 ENTERS_APOS_QTD_PADRAO = 18     # Enters finais até OK + confirmação do OK
 ESPERA_APOS_OK = 1.5            # tempo (s) para salvar e limpar o formulário
 VALOR_UNITARIO_PADRAO = "0,00"
@@ -54,10 +57,17 @@ TAMANHO_MAX_IMAGEM = 2400       # px (maior lado) antes de enviar para a API
 # Códigos de tecla virtual do Windows (atalhos globais via user32.GetAsyncKeyState)
 VK_ESCAPE = 0x1B                # Esc  -> Parar digitação imediatamente
 VK_F12 = 0x7B                   # F12  -> Pausar / Retomar digitação
+VK_BACK = 0x08                  # Backspace
+VK_SHIFT = 0x10                 # Shift
+VK_END = 0x23                   # End
+VK_HOME = 0x24                  # Home
+VK_DELETE = 0x2E                # Delete
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
 
 INSTRUCAO_RODAPE = (
-    "Calibração em 2 etapas (5s + 5s): 1/2 deixe o mouse sobre OPERAÇÃO (bip) "
-    "e 2/2 sobre a 1ª caixinha de PRODUTO (bip)."
+    "Clique em '🎯 Calibrar Posições' 1 vez (salvo em config.json). "
+    "Depois deixe o WK Radar aberto atrás e clique em '▶ Digitar no WK Radar'."
 )
 
 pyautogui.FAILSAFE = True       # mouse no canto superior esquerdo = aborta
@@ -71,6 +81,7 @@ else:
     PASTA_BASE = os.path.dirname(os.path.abspath(__file__))
 
 load_dotenv(os.path.join(PASTA_BASE, ".env"))
+CAMINHO_CONFIG = os.path.join(PASTA_BASE, "config.json")
 
 
 # =============================================================================
@@ -78,8 +89,9 @@ load_dotenv(os.path.join(PASTA_BASE, ".env"))
 # =============================================================================
 class ItemCorte(BaseModel):
     codigo: str = Field(
-        description="Código exato da peça impresso na folha, incluindo hífens, "
-                    "barras, pontos, espaços internos e letras."
+        description="Código da peça impresso na folha (sem letras de prefixo no início "
+                    "antes do número, mantendo pontos, hífens, barras, espaços internos e "
+                    "letras no meio ou no final do código)."
     )
     valor_unitario: str = Field(
         default=VALOR_UNITARIO_PADRAO,
@@ -109,6 +121,13 @@ class ItemCorte(BaseModel):
     erro_popup: SkipJsonSchema[bool] = Field(default=False, exclude=True)
     resolvida_manual: SkipJsonSchema[bool] = Field(default=False, exclude=True)
 
+    @field_validator("valor_unitario", mode="before")
+    @classmethod
+    def _fallback_valor_unitario(cls, v):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return VALOR_UNITARIO_PADRAO
+        return str(v)
+
 
 class ResultadoLeitura(BaseModel):
     itens: list[ItemCorte] = Field(description="Lista de peças lidas nas folhas.")
@@ -123,10 +142,11 @@ e rasuras feitas à caneta pelo operador.
 
 REGRAS OBRIGATÓRIAS:
 1. CÓDIGO ("codigo"): fica na coluna "Referência" (ex.: "3.24.031", "L3.12.084D", \
-"P3.27.133"). Transcreva o código da peça EXATAMENTE como aparece, caractere por \
-caractere, mantendo pontos (.), hífens (-), barras (/), underscores, letras \
-maiúsculas/minúsculas e zeros à esquerda. NÃO use o número da primeira coluna "#" \
-como código.
+"P3.27.133"). Ignore qualquer letra no início antes do código numérico (prefixos), \
+retornando sem essas letras iniciais (ex.: "L3.12.084D" -> "3.12.084D", \
+"P3.27.133" -> "3.27.133"), mas mantenha SEMPRE letras no meio ou no final do código \
+(como o "D" final em "3.12.084D"), além de pontos (.), hífens (-), barras (/), \
+underscores e zeros à esquerda. NÃO use o número da primeira coluna "#" como código.
 2. PREÇO / VALOR UNITÁRIO ("valor_unitario"):
    - Fica na coluna "Preço" (os valores começam com "R$", mesmo que o título da coluna \
 esteja coberto por um clipe ou post-it).
@@ -210,6 +230,178 @@ def verificar_popup(hwnd_wk: int) -> bool:
     return obter_hwnd_ativo() != hwnd_wk
 
 
+def janela_valida(hwnd: int) -> bool:
+    """Retorna True se `hwnd` corresponde a uma janela ainda aberta no Windows."""
+    if not hwnd:
+        return False
+    try:
+        return bool(ctypes.windll.user32.IsWindow(int(hwnd)))
+    except Exception:
+        return False
+
+
+def focar_janela(hwnd: int) -> bool:
+    """Traz a janela identificada por `hwnd` para o primeiro plano."""
+    if not hwnd:
+        return False
+    try:
+        return bool(ctypes.windll.user32.SetForegroundWindow(int(hwnd)))
+    except Exception:
+        return False
+
+
+def _normalizar_ponto(valor) -> tuple[int, int] | None:
+    """Converte [x, y], (x, y) ou objeto com .x/.y em tupla (int, int)."""
+    if valor is None:
+        return None
+    if hasattr(valor, "x") and hasattr(valor, "y"):
+        try:
+            return (int(valor.x), int(valor.y))
+        except (TypeError, ValueError):
+            return None
+    if isinstance(valor, (list, tuple)) and len(valor) == 2:
+        try:
+            return (int(valor[0]), int(valor[1]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def carregar_config(caminho: str | None = None) -> dict:
+    """Carrega e valida config.json da pasta do aplicativo; retorna {} se ausente/inválido."""
+    caminho_alvo = caminho or CAMINHO_CONFIG
+    if not os.path.isfile(caminho_alvo):
+        return {}
+    try:
+        with open(caminho_alvo, "r", encoding="utf-8") as arq:
+            dados = json.load(arq)
+    except Exception:
+        return {}
+    if not isinstance(dados, dict):
+        return {}
+
+    cfg: dict = {}
+    pos_op = _normalizar_ponto(dados.get("pos_operacao"))
+    pos_prod = _normalizar_ponto(dados.get("pos_produto"))
+    if pos_op is not None:
+        cfg["pos_operacao"] = pos_op
+    if pos_prod is not None:
+        cfg["pos_produto"] = pos_prod
+
+    if "setas_operacao" in dados:
+        try:
+            cfg["setas_operacao"] = max(0, min(int(dados["setas_operacao"]), 50))
+        except (TypeError, ValueError):
+            pass
+
+    if "enters_apos_qtd" in dados:
+        try:
+            cfg["enters_apos_qtd"] = max(1, min(int(dados["enters_apos_qtd"]), 50))
+        except (TypeError, ValueError):
+            pass
+
+    if "espera_apos_produto" in dados:
+        try:
+            val_prod = str(dados["espera_apos_produto"]).strip().replace(",", ".")
+            cfg["espera_apos_produto"] = max(0.1, min(float(val_prod), 30.0))
+        except (TypeError, ValueError):
+            pass
+
+    if "espera_apos_ok" in dados:
+        try:
+            val_ok = str(dados["espera_apos_ok"]).strip().replace(",", ".")
+            cfg["espera_apos_ok"] = max(0.1, min(float(val_ok), 30.0))
+        except (TypeError, ValueError):
+            pass
+
+    return cfg
+
+
+def salvar_config(pos_operacao, pos_produto, setas_operacao: int,
+                  enters_apos_qtd: int, espera_apos_ok: float,
+                  espera_apos_produto: float = ESPERA_APOS_PRODUTO,
+                  caminho: str | None = None) -> None:
+    """Salva calibração de posições e parâmetros do robô em config.json."""
+    caminho_alvo = caminho or CAMINHO_CONFIG
+    op = _normalizar_ponto(pos_operacao)
+    prod = _normalizar_ponto(pos_produto)
+    dados = {
+        "pos_operacao": [op[0], op[1]] if op is not None else None,
+        "pos_produto": [prod[0], prod[1]] if prod is not None else None,
+        "setas_operacao": int(setas_operacao),
+        "espera_apos_produto": round(float(espera_apos_produto), 2),
+        "enters_apos_qtd": int(enters_apos_qtd),
+        "espera_apos_ok": round(float(espera_apos_ok), 2),
+    }
+    pasta = os.path.dirname(os.path.abspath(caminho_alvo))
+    if pasta:
+        os.makedirs(pasta, exist_ok=True)
+    with open(caminho_alvo, "w", encoding="utf-8") as arq:
+        json.dump(dados, arq, indent=2, ensure_ascii=False)
+
+
+def _enviar_tecla_win(vk_code: int, estendida: bool = False) -> None:
+    """Envia tecla via keybd_event com scan code real e flag estendida (imune ao NumLock)."""
+    user32 = ctypes.windll.user32
+    scan = int(user32.MapVirtualKeyW(vk_code, 0))
+    flags_down = KEYEVENTF_EXTENDEDKEY if estendida else 0
+    flags_up = flags_down | KEYEVENTF_KEYUP
+    user32.keybd_event(vk_code, scan, flags_down, 0)
+    time.sleep(0.015)
+    user32.keybd_event(vk_code, scan, flags_up, 0)
+
+
+def _enviar_shift_home_win() -> None:
+    """Envia Shift+Home via keybd_event com scan codes reais (imune ao NumLock)."""
+    user32 = ctypes.windll.user32
+    scan_shift = int(user32.MapVirtualKeyW(VK_SHIFT, 0))
+    scan_home = int(user32.MapVirtualKeyW(VK_HOME, 0))
+    user32.keybd_event(VK_SHIFT, scan_shift, 0, 0)
+    time.sleep(0.015)
+    user32.keybd_event(VK_HOME, scan_home, KEYEVENTF_EXTENDEDKEY, 0)
+    time.sleep(0.015)
+    user32.keybd_event(VK_HOME, scan_home, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+    time.sleep(0.015)
+    user32.keybd_event(VK_SHIFT, scan_shift, KEYEVENTF_KEYUP, 0)
+
+
+def digitar_campo_seguro(texto, limpar: bool = True) -> None:
+    """Limpa o campo (se `limpar=True`) e digita `texto` direto, usando Ctrl+V apenas como fallback."""
+    texto_limpo = "" if texto is None else str(texto).strip()
+    if limpar:
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.06)
+        _enviar_tecla_win(VK_BACK)
+        time.sleep(0.05)
+        _enviar_tecla_win(VK_END, estendida=True)
+        time.sleep(0.05)
+        _enviar_shift_home_win()
+        time.sleep(0.05)
+        _enviar_tecla_win(VK_BACK)
+        time.sleep(0.05)
+        for _ in range(8):
+            _enviar_tecla_win(VK_BACK)
+            time.sleep(0.02)
+        for _ in range(8):
+            _enviar_tecla_win(VK_DELETE, estendida=True)
+            time.sleep(0.02)
+        time.sleep(0.05)
+
+    if texto_limpo:
+        if re.fullmatch(r"[A-Za-z0-9,.\-]+", texto_limpo):
+            pyautogui.write(texto_limpo, interval=0.04)
+        else:
+            pyperclip.copy(texto_limpo)
+            time.sleep(0.15)
+            pyautogui.hotkey("ctrl", "v")
+    time.sleep(0.2)
+
+
+def limpar_e_digitar_destino(valor) -> None:
+    """Limpa completamente o campo Local de Destino e digita `valor` sem duplicar."""
+    digitar_campo_seguro(valor, limpar=True)
+
+
 def _formatar_valor_unitario(texto: str) -> str:
     """Converte preços como 'R$ 199.906', '199.906', '199,906' ou '10.97' para '199,90' e '10,97'.
 
@@ -220,6 +412,8 @@ def _formatar_valor_unitario(texto: str) -> str:
     if not s:
         return VALOR_UNITARIO_PADRAO
     s = s.replace("R$", "").replace("r$", "").strip()
+    if not s:
+        return VALOR_UNITARIO_PADRAO
     # Se vier no formato "199.906,00" (IA interpretou ponto como milhar e adicionou ,00),
     # desfaz para "199.906" quando houver apenas 1 ponto seguido de 3 dígitos e ",00":
     if s.endswith(",00") and s.count(".") == 1 and s.count(",") == 1:
@@ -241,6 +435,14 @@ def _formatar_valor_unitario(texto: str) -> str:
     return s
 
 
+def normalizar_codigo(codigo: str) -> str:
+    """Remove letras no início do código (e espaço/hífen logo após), preservando meio/fim."""
+    codigo = (codigo or "").strip()
+    if not re.search(r"\d", codigo):
+        return codigo
+    return re.sub(r"^[A-Za-z]+[\s\-]*", "", codigo)
+
+
 def _normalizar_item(item: ItemCorte) -> ItemCorte:
     """Garante formatação correta de valor_unitario ('199,90') e padrão '23' para local_destino."""
     val = _formatar_valor_unitario(item.valor_unitario)
@@ -248,6 +450,44 @@ def _normalizar_item(item: ItemCorte) -> ItemCorte:
     if val != item.valor_unitario or dest != item.local_destino:
         return item.model_copy(update={"valor_unitario": val, "local_destino": dest})
     return item
+
+
+def consolidar_itens_extraidos(itens: list[ItemCorte]) -> list[ItemCorte]:
+    """Limpa prefixos de letras nos códigos extraídos e consolida duplicatas em ordem."""
+    grupos: dict[str, ItemCorte] = {}
+    for item in itens:
+        item_norm = _normalizar_item(item)
+        codigo_limpo = normalizar_codigo(item_norm.codigo)
+        item_limpo = (
+            item_norm
+            if codigo_limpo == item_norm.codigo
+            else item_norm.model_copy(update={"codigo": codigo_limpo})
+        )
+        existente = grupos.get(codigo_limpo)
+        if existente is None:
+            grupos[codigo_limpo] = item_limpo
+            continue
+
+        obs_partes = [
+            p.strip()
+            for texto in (existente.observacao, item_limpo.observacao)
+            for p in (texto or "").split(" | ")
+            if p.strip()
+        ]
+        obs_unidas = " | ".join(dict.fromkeys(obs_partes))
+        valor_unit = existente.valor_unitario
+        if valor_unit == VALOR_UNITARIO_PADRAO and item_limpo.valor_unitario != VALOR_UNITARIO_PADRAO:
+            valor_unit = item_limpo.valor_unitario
+
+        grupos[codigo_limpo] = existente.model_copy(
+            update={
+                "quantidade_final": existente.quantidade_final + item_limpo.quantidade_final,
+                "alterado_a_mao": existente.alterado_a_mao or item_limpo.alterado_a_mao,
+                "observacao": obs_unidas,
+                "valor_unitario": valor_unit,
+            }
+        )
+    return list(grupos.values())
 
 
 def imagem_para_base64(img: Image.Image) -> str:
@@ -333,7 +573,7 @@ def ler_folhas_com_gemini(imagens: list[Image.Image], aviso=None) -> list[ItemCo
         if not texto:
             raise RuntimeError("A IA não retornou nenhum conteúdo. Tente novamente.")
         itens = ResultadoLeitura.model_validate_json(texto).itens
-        return [_normalizar_item(it) for it in itens]
+        return consolidar_itens_extraidos(itens)
 
     raise RuntimeError(f"Todos os modelos estão indisponíveis agora: {ultimo_erro}")
 
@@ -358,6 +598,7 @@ class App:
 
         self.itens: list[ItemCorte] = []
         self.ocupado = False
+        self.calibrando = False
         self.digitando = False
         self.pausado = False
         self.parar_solicitado = False
@@ -365,12 +606,23 @@ class App:
         self._f12_anterior = False
         self.idx_pausado_popup: int | None = None
 
+        cfg = carregar_config()
+        self.pos_operacao: tuple[int, int] | None = cfg.get("pos_operacao")
+        self.pos_produto: tuple[int, int] | None = cfg.get("pos_produto")
+        self.hwnd_wk: int = 0
+
         # Variáveis do Painel de Calibração
-        self.var_setas_operacao = tk.StringVar(value=str(SETAS_OPERACAO_PADRAO))
-        self.var_enters_apos_qtd = tk.StringVar(value=str(ENTERS_APOS_QTD_PADRAO))
-        self.var_espera_apos_ok = tk.StringVar(value=f"{ESPERA_APOS_OK:.1f}")
+        setas_ini = cfg.get("setas_operacao", SETAS_OPERACAO_PADRAO)
+        espera_prod_ini = cfg.get("espera_apos_produto", ESPERA_APOS_PRODUTO)
+        enters_ini = cfg.get("enters_apos_qtd", ENTERS_APOS_QTD_PADRAO)
+        espera_ini = cfg.get("espera_apos_ok", ESPERA_APOS_OK)
+        self.var_setas_operacao = tk.StringVar(value=str(setas_ini))
+        self.var_espera_apos_produto = tk.StringVar(value=f"{float(espera_prod_ini):.1f}")
+        self.var_enters_apos_qtd = tk.StringVar(value=str(enters_ini))
+        self.var_espera_apos_ok = tk.StringVar(value=f"{float(espera_ini):.1f}")
 
         self._montar_interface()
+        self._atualizar_indicador_calibracao()
 
         # Ctrl+V na janela principal (não afeta caixas de edição)
         self.root.bind("<Control-v>", self._atalho_colar)
@@ -504,13 +756,19 @@ class App:
         self.spn_setas_operacao = ttk.Spinbox(
             linha_cal, from_=0, to=20, increment=1, width=5,
             textvariable=self.var_setas_operacao, font=("Segoe UI", 10))
-        self.spn_setas_operacao.pack(side="left", padx=(4, 18))
+        self.spn_setas_operacao.pack(side="left", padx=(4, 10))
+
+        ttk.Label(linha_cal, text="Espera após Produto (s):").pack(side="left")
+        self.spn_espera_apos_produto = ttk.Spinbox(
+            linha_cal, from_=0.2, to=15.0, increment=0.1, width=6,
+            textvariable=self.var_espera_apos_produto, font=("Segoe UI", 10))
+        self.spn_espera_apos_produto.pack(side="left", padx=(4, 10))
 
         ttk.Label(linha_cal, text="Enters após Quantidade (até OK):").pack(side="left")
         self.spn_enters_apos_qtd = ttk.Spinbox(
             linha_cal, from_=1, to=50, increment=1, width=5,
             textvariable=self.var_enters_apos_qtd, font=("Segoe UI", 10))
-        self.spn_enters_apos_qtd.pack(side="left", padx=(4, 18))
+        self.spn_enters_apos_qtd.pack(side="left", padx=(4, 10))
 
         ttk.Label(linha_cal, text="Espera após OK (s):").pack(side="left")
         self.spn_espera_apos_ok = ttk.Spinbox(
@@ -527,19 +785,29 @@ class App:
         self.btn_parar = ttk.Button(
             linha_acoes, text="⏹️ Parar (Esc)",
             command=self.parar_digitacao, state="disabled")
+        self.btn_calibrar = ttk.Button(
+            linha_acoes, text="🎯 Calibrar Posições",
+            command=self.iniciar_calibracao,
+        )
+        self.lbl_status_calibracao = tk.Label(
+            linha_acoes, text="⚠️ Não calibrado", fg="#d97706",
+            font=("Segoe UI", 10, "bold"),
+        )
         self.btn_pausar.pack(side="left", padx=(0, 6))
         self.btn_parar.pack(side="left", padx=6)
+        self.btn_calibrar.pack(side="left", padx=(10, 6))
+        self.lbl_status_calibracao.pack(side="left", padx=4)
 
         self.btn_digitar = ttk.Button(
-            linha_acoes, text=f"⌨️ Digitar no WK Radar ({CONTAGEM_SEGUNDOS}s)",
+            linha_acoes, text="▶ Digitar no WK Radar",
             command=self.iniciar_digitacao)
         self.btn_digitar_sel = ttk.Button(
-            linha_acoes, text=f"▶️ Da Linha Selecionada ({CONTAGEM_SEGUNDOS}s)",
+            linha_acoes, text="▶️ Da Linha Selecionada",
             command=self.iniciar_digitacao_da_selecionada)
         self.btn_digitar.pack(side="right", padx=(6, 0))
         self.btn_digitar_sel.pack(side="right", padx=6)
 
-        # --- rodapé com instrução fixa do campo DATA + status
+        # --- rodapé com instrução fixa + status
         rodape = ttk.Frame(self.root, padding=(10, 2, 10, 10))
         rodape.pack(fill="x")
 
@@ -576,6 +844,52 @@ class App:
     def _set_status(self, texto: str):
         self.var_status.set(texto)
 
+    def _atualizar_indicador_calibracao(self):
+        if self.pos_operacao is not None and self.pos_produto is not None:
+            self.lbl_status_calibracao.configure(text="✅ Calibrado", fg="#198754")
+        else:
+            self.lbl_status_calibracao.configure(text="⚠️ Não calibrado", fg="#d97706")
+
+    def _salvar_config_atual(self):
+        salvar_config(
+            self.pos_operacao,
+            self.pos_produto,
+            self._ler_setas_operacao(),
+            self._ler_enters_apos_qtd(),
+            self._ler_espera_apos_ok(),
+            espera_apos_produto=self._ler_espera_apos_produto(),
+        )
+
+    def _garantir_calibrado(self) -> bool:
+        if self.pos_operacao is None or self.pos_produto is None:
+            messagebox.showwarning(
+                "Calibração necessária",
+                "As posições ainda não foram calibradas.\n\n"
+                "Clique primeiro em '🎯 Calibrar Posições' para salvar os campos Operação e Produto.",
+            )
+            return False
+        return True
+
+    def _restaurar_janela_app(self):
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def _obter_hwnd_app(self) -> int:
+        try:
+            wid = int(self.root.winfo_id())
+            anc = int(ctypes.windll.user32.GetAncestor(wid, 2))
+            return anc or wid
+        except Exception:
+            try:
+                return int(self.root.winfo_id())
+            except Exception:
+                return 0
+
     def _definir_botoes_retomada(self, habilitar: bool):
         estado = "normal" if habilitar else "disabled"
         self.btn_continuar_proxima.configure(state=estado)
@@ -591,16 +905,19 @@ class App:
             self._fechar_editor(salvar=True)
         estado = "disabled" if ocupado else "normal"
         for btn in (self.btn_abrir, self.btn_colar, self.btn_limpar,
-                    self.btn_editar, self.btn_digitar, self.btn_digitar_sel,
-                    self.btn_desmarcar):
+                    self.btn_editar, self.btn_calibrar, self.btn_digitar,
+                    self.btn_digitar_sel, self.btn_desmarcar):
             btn.configure(state=estado)
 
         em_digitacao = ocupado and modo == "digitacao"
+        em_calibracao = ocupado and modo == "calibracao"
         self.btn_pausar.configure(
             state="normal" if em_digitacao else "disabled",
             text="▶️ Retomar (F12)" if (em_digitacao and self.pausado) else "⏸️ Pausar (F12)",
         )
-        self.btn_parar.configure(state="normal" if em_digitacao else "disabled")
+        self.btn_parar.configure(
+            state="normal" if (em_digitacao or em_calibracao) else "disabled"
+        )
 
         pode_retomar_popup = (
             not ocupado
@@ -624,6 +941,14 @@ class App:
         except ValueError:
             self.var_enters_apos_qtd.set(str(ENTERS_APOS_QTD_PADRAO))
             return ENTERS_APOS_QTD_PADRAO
+
+    def _ler_espera_apos_produto(self) -> float:
+        try:
+            valor = float(self.var_espera_apos_produto.get().strip().replace(",", "."))
+            return max(0.1, min(valor, 30.0))
+        except ValueError:
+            self.var_espera_apos_produto.set(f"{ESPERA_APOS_PRODUTO:.1f}")
+            return ESPERA_APOS_PRODUTO
 
     def _ler_espera_apos_ok(self) -> float:
         try:
@@ -1188,11 +1513,10 @@ class App:
     def _monitorar_atalhos_globais(self):
         esc_atual = _tecla_pressionada_global(VK_ESCAPE)
         f12_atual = _tecla_pressionada_global(VK_F12)
-        if self.digitando:
-            if esc_atual and not self._esc_anterior:
-                self.parar_digitacao()
-            elif f12_atual and not self._f12_anterior:
-                self.alternar_pausa(via_atalho=True)
+        if (self.digitando or self.calibrando) and esc_atual and not self._esc_anterior:
+            self.parar_digitacao()
+        elif self.digitando and f12_atual and not self._f12_anterior:
+            self.alternar_pausa(via_atalho=True)
         self._esc_anterior = esc_atual
         self._f12_anterior = f12_atual
         self.root.after(30, self._monitorar_atalhos_globais)
@@ -1213,10 +1537,79 @@ class App:
                 self._set_status("▶️ Retomando digitação no WK Radar...")
 
     def parar_digitacao(self):
-        if not self.digitando:
+        if not (self.digitando or self.calibrando):
             return
         self.parar_solicitado = True
         self.pausado = False
+
+    # ----------------------------------------------------------- calibração 2 pontos
+    def iniciar_calibracao(self):
+        """Executa a contagem de 2 etapas (5s Operação + 5s Produto) e salva em config.json."""
+        if self.ocupado:
+            return
+        self._fechar_editor(salvar=True)
+        self.calibrando = True
+        self.pausado = False
+        self.parar_solicitado = False
+        self._esc_anterior = _tecla_pressionada_global(VK_ESCAPE)
+        self._set_ocupado(True, modo="calibracao")
+        self._contagem_calibracao(1, CONTAGEM_ETAPA_SEGUNDOS)
+
+    def _contagem_calibracao(self, etapa: int, restante: int,
+                             pos_operacao=None, hwnd_wk: int = 0):
+        if not self.calibrando:
+            return
+        if self.parar_solicitado:
+            self._fim_calibracao("🛑 Calibração cancelada pelo usuário (Esc).")
+            return
+
+        if etapa == 1:
+            if restante > 0:
+                self._set_status(
+                    f"⏱️ 1/2: Deixe o mouse parado sobre o campo OPERAÇÃO ({restante}s)..."
+                )
+                self.root.after(1000, self._contagem_calibracao, 1, restante - 1, None, 0)
+                return
+
+            pos_operacao = _normalizar_ponto(pyautogui.position())
+            hwnd_wk = obter_hwnd_ativo()
+            try:
+                winsound.Beep(800, 150)
+            except Exception:
+                pass
+            self._contagem_calibracao(2, CONTAGEM_ETAPA_SEGUNDOS, pos_operacao, hwnd_wk)
+            return
+
+        if restante > 0:
+            self._set_status(
+                f"⏱️ 2/2: Agora deixe o mouse parado sobre a 1ª caixinha do campo PRODUTO ({restante}s)..."
+            )
+            self.root.after(1000, self._contagem_calibracao, 2, restante - 1, pos_operacao, hwnd_wk)
+            return
+
+        pos_produto = _normalizar_ponto(pyautogui.position())
+        try:
+            winsound.Beep(800, 150)
+        except Exception:
+            pass
+        self.pos_operacao = pos_operacao
+        self.pos_produto = pos_produto
+        self.hwnd_wk = hwnd_wk
+        self._salvar_config_atual()
+        self._atualizar_indicador_calibracao()
+        self._fim_calibracao(
+            f"✅ Calibração salva em config.json! "
+            f"(Operação {pos_operacao[0]},{pos_operacao[1]} • "
+            f"Produto {pos_produto[0]},{pos_produto[1]})"
+        )
+
+    def _fim_calibracao(self, mensagem: str):
+        self.calibrando = False
+        self.pausado = False
+        self.parar_solicitado = False
+        self._set_ocupado(False)
+        self._set_status(mensagem)
+        self._restaurar_janela_app()
 
     # ------------------------------------------------------------ digitação
     def iniciar_digitacao(self):
@@ -1224,6 +1617,8 @@ class App:
         if self.ocupado:
             return
         self._fechar_editor(salvar=True)
+        if not self._garantir_calibrado():
+            return
         com_qtd = [(idx, it) for idx, it in enumerate(self.itens) if it.quantidade_final > 0]
         if not com_qtd:
             messagebox.showwarning("Nada para digitar",
@@ -1249,6 +1644,8 @@ class App:
         if self.ocupado:
             return
         self._fechar_editor(salvar=True)
+        if not self._garantir_calibrado():
+            return
         iid = self._selecionada()
         if iid is None:
             messagebox.showinfo(
@@ -1268,6 +1665,14 @@ class App:
         self._iniciar_fila_digitacao(fila)
 
     def _iniciar_fila_digitacao(self, fila: list[tuple[int, ItemCorte]]):
+        if not self._garantir_calibrado():
+            return
+        setas_operacao = self._ler_setas_operacao()
+        espera_apos_produto = self._ler_espera_apos_produto()
+        enters_apos_qtd = self._ler_enters_apos_qtd()
+        espera_apos_ok = self._ler_espera_apos_ok()
+        self._salvar_config_atual()
+
         self._limpar_estado_popup()
         self.digitando = True
         self.pausado = False
@@ -1276,61 +1681,14 @@ class App:
         self._f12_anterior = _tecla_pressionada_global(VK_F12)
         self._set_ocupado(True, modo="digitacao")
         copia_fila = [(idx, it.model_copy()) for idx, it in fila]
-        self._contagem(1, CONTAGEM_ETAPA_SEGUNDOS, copia_fila)
-
-    def _contagem(self, etapa: int, restante: int, fila: list[tuple[int, ItemCorte]],
-                  pos_operacao=None, hwnd_wk: int = 0):
-        if self.parar_solicitado:
-            self._fim_digitacao("🛑 Digitação cancelada pelo usuário (Esc).")
-            return
-        if self.pausado:
-            self._set_status(
-                f"⏸️ Calibração {etapa}/2 pausada ({restante}s) — F12 para retomar ou Esc para parar."
-            )
-            self.root.after(200, self._contagem, etapa, restante, fila, pos_operacao, hwnd_wk)
-            return
-
-        if etapa == 1:
-            if restante > 0:
-                self._set_status(
-                    f"⏱️ 1/2: Deixe o mouse parado sobre o campo OPERAÇÃO ({restante}s)..."
-                )
-                self.root.after(1000, self._contagem, 1, restante - 1, fila, None, 0)
-                return
-
-            pos_operacao = pyautogui.position()
-            hwnd_wk = obter_hwnd_ativo()
-            try:
-                winsound.Beep(800, 150)
-            except Exception:
-                pass
-            self._contagem(2, CONTAGEM_ETAPA_SEGUNDOS, fila, pos_operacao, hwnd_wk)
-            return
-
-        if restante > 0:
-            self._set_status(
-                f"⏱️ 2/2: Agora deixe o mouse parado sobre a 1ª caixinha do campo PRODUTO ({restante}s)..."
-            )
-            self.root.after(1000, self._contagem, 2, restante - 1, fila, pos_operacao, hwnd_wk)
-            return
-
-        # Fim da etapa 2: captura posição de Produto e inicia digitação
-        pos_produto = pyautogui.position()
-        try:
-            winsound.Beep(800, 150)
-        except Exception:
-            pass
-        setas_operacao = self._ler_setas_operacao()
-        enters_apos_qtd = self._ler_enters_apos_qtd()
-        espera_apos_ok = self._ler_espera_apos_ok()
         self._set_status(
-            f"⌨️ Digitando no WK Radar (Operação {pos_operacao.x},{pos_operacao.y} • "
-            f"Produto {pos_produto.x},{pos_produto.y})... [F12 pausa • Esc para]"
+            f"⌨️ Digitando no WK Radar (Operação {self.pos_operacao[0]},{self.pos_operacao[1]} • "
+            f"Produto {self.pos_produto[0]},{self.pos_produto[1]})... [F12 pausa • Esc para]"
         )
         threading.Thread(
             target=self._digitar,
-            args=(fila, pos_operacao, pos_produto, hwnd_wk,
-                  setas_operacao, enters_apos_qtd, espera_apos_ok),
+            args=(copia_fila, self.pos_operacao, self.pos_produto, self.hwnd_wk,
+                  setas_operacao, enters_apos_qtd, espera_apos_ok, espera_apos_produto),
             daemon=True,
         ).start()
 
@@ -1354,7 +1712,8 @@ class App:
 
     def _digitar(self, fila: list[tuple[int, ItemCorte]],
                  pos_operacao, pos_produto, hwnd_wk: int,
-                 setas_operacao: int, enters_apos_qtd: int, espera_apos_ok: float):
+                 setas_operacao: int, enters_apos_qtd: int, espera_apos_ok: float,
+                 espera_apos_produto: float = ESPERA_APOS_PRODUTO):
         total = len(fila)
         digitados_agora = 0
 
@@ -1370,6 +1729,36 @@ class App:
             return False
 
         try:
+            # Minimiza o aplicativo e garante o foco no WK Radar antes de iniciar
+            self.root.after(0, self.root.iconify)
+            if self._dormir_interrompivel(0.5):
+                self.root.after(
+                    0, self._fim_digitacao,
+                    "🛑 Digitação cancelada pelo usuário (Esc)."
+                )
+                return
+
+            if janela_valida(hwnd_wk):
+                focar_janela(hwnd_wk)
+                if self._dormir_interrompivel(0.25):
+                    self.root.after(
+                        0, self._fim_digitacao,
+                        "🛑 Digitação cancelada pelo usuário (Esc)."
+                    )
+                    return
+            else:
+                hwnd_wk = obter_hwnd_ativo()
+                if not hwnd_wk or hwnd_wk == self._obter_hwnd_app():
+                    pyautogui.click(pos_operacao)
+                    if self._dormir_interrompivel(0.2):
+                        self.root.after(
+                            0, self._fim_digitacao,
+                            "🛑 Digitação cancelada pelo usuário (Esc)."
+                        )
+                        return
+                    hwnd_wk = obter_hwnd_ativo()
+                self.hwnd_wk = hwnd_wk
+
             for pos, (idx, item) in enumerate(fila, start=1):
                 if item.quantidade_final <= 0:
                     continue
@@ -1423,20 +1812,13 @@ class App:
                 if checar_popup(idx, item.codigo):
                     return
                 pyautogui.click(pos_produto)
-                if self._dormir_interrompivel(0.25):
+                if self._dormir_interrompivel(0.35):
                     break
 
                 if checar_popup(idx, item.codigo):
                     return
-                pyautogui.hotkey("ctrl", "a")
-                if self._dormir_interrompivel(0.1):
-                    break
-
-                if checar_popup(idx, item.codigo):
-                    return
-                pyperclip.copy(item.codigo)
-                pyautogui.hotkey("ctrl", "v")
-                if self._dormir_interrompivel(0.2):
+                digitar_campo_seguro(item.codigo, limpar=True)
+                if self._aguardar_pausa_ou_parada():
                     break
 
                 # 3. Fluxo por Enter a partir de Produto
@@ -1444,7 +1826,7 @@ class App:
                 if checar_popup(idx, item.codigo):
                     return
                 pyautogui.press("enter")
-                if self._dormir_interrompivel(0.6):
+                if self._dormir_interrompivel(espera_apos_produto):
                     break
                 if checar_popup(idx, item.codigo):
                     return
@@ -1458,16 +1840,23 @@ class App:
 
                 if checar_popup(idx, item.codigo):
                     return
-                pyperclip.copy(item.valor_unitario or VALOR_UNITARIO_PADRAO)
-                pyautogui.hotkey("ctrl", "v")
-                if self._dormir_interrompivel(0.2):
+                valor_unit = (item.valor_unitario or "").strip() or VALOR_UNITARIO_PADRAO
+                digitar_campo_seguro(valor_unit, limpar=True)
+                if self._aguardar_pausa_ou_parada():
                     break
 
-                # Enter 3: vai para Local de Destino (preenchido automaticamente, aguarda 1.5s)
+                # Enter 3: vai para Local de Destino (aguarda 1.5s, limpa e digita destino)
                 if checar_popup(idx, item.codigo):
                     return
                 pyautogui.press("enter")
                 if self._dormir_interrompivel(1.5):
+                    break
+
+                if checar_popup(idx, item.codigo):
+                    return
+                destino_val = (item.local_destino or "").strip() or LOCAL_DESTINO_PADRAO
+                digitar_campo_seguro(destino_val, limpar=True)
+                if self._aguardar_pausa_ou_parada():
                     break
 
                 # Enter 4: sai de Local de Destino / campo intermediário
@@ -1486,9 +1875,8 @@ class App:
 
                 if checar_popup(idx, item.codigo):
                     return
-                pyperclip.copy(str(item.quantidade_final))
-                pyautogui.hotkey("ctrl", "v")
-                if self._dormir_interrompivel(0.2):
+                digitar_campo_seguro(str(item.quantidade_final), limpar=True)
+                if self._aguardar_pausa_ou_parada():
                     break
 
                 # Enters finais até o OK
@@ -1551,15 +1939,13 @@ class App:
         self._set_status(
             f"⚠️ PAUSADO POR POP-UP na peça '{codigo}' — Janela: {titulo_popup}"
         )
-        try:
-            self.root.deiconify()
-            self.root.lift()
-        except tk.TclError:
-            pass
+        self._restaurar_janela_app()
 
     def continuar_proxima_peca(self):
         """Marca a peça pausada como resolvida manualmente e retoma pela próxima."""
         if self.ocupado or self.idx_pausado_popup is None:
+            return
+        if not self._garantir_calibrado():
             return
         if not (0 <= self.idx_pausado_popup < len(self.itens)):
             self._limpar_estado_popup()
@@ -1580,6 +1966,8 @@ class App:
     def repetir_peca_pausada(self):
         """Retoma a digitação começando novamente pela peça onde ocorreu o pop-up."""
         if self.ocupado or self.idx_pausado_popup is None:
+            return
+        if not self._garantir_calibrado():
             return
         if not (0 <= self.idx_pausado_popup < len(self.itens)):
             self._limpar_estado_popup()
@@ -1603,11 +1991,7 @@ class App:
         self.parar_solicitado = False
         self._set_ocupado(False)
         self._set_status(mensagem)
-        try:
-            self.root.deiconify()
-            self.root.lift()
-        except tk.TclError:
-            pass
+        self._restaurar_janela_app()
 
 
 def main():
