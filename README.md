@@ -1,32 +1,64 @@
-# 🔦 Leitor de Folhas de Corte a Laser → WK Radar
+# 🔦 Leitor de Corte a Laser → WK Radar (Entrada da Produção)
 
-Aplicação desktop em Python (`tkinter`) para Windows que lê fotos de folhas de controle de corte a laser — inclusive com **rasuras e anotações feitas à caneta** — usando a API do **Google Gemini** (`google-genai` com *Structured Outputs* via Pydantic) e preenche automaticamente a tela de **Entrada da Produção** no ERP **WK Radar**.
+Aplicação desktop em Python (`tkinter`) para Windows que lê **relatórios PDF (padrão HMAGRO / CypCut)** localmente em alta velocidade — além de **PDFs escaneados e fotos** (com anotações/rasuras à caneta) via **Google Gemini** — e lança automaticamente os itens na tela de **Entrada da Produção (Inclusão)** do ERP **WK Radar**.
 
 ---
 
 ## ✨ Principais Funcionalidades
 
-- **Leitura Inteligente com IA (Google Gemini):**
-  - Mantém o código exato da peça (hífens, barras, pontos e letras).
-  - Prioriza automaticamente quantidades corrigidas à caneta quando o valor impresso estiver riscado/rasurado, destacando a linha em **amarelo (`#fff3cd`)** para conferência humana.
-  - Preenche automaticamente `Valor Unitário` (padrão `"0,00"`) e `Local de Destino` (padrão `"23"`).
-- **Suporte a Múltiplas Folhas e Lotes:**
-  - **📂 Abrir Foto(s) da Folha:** seleciona 1 ou mais imagens de uma vez e envia todas juntas na mesma requisição, **consolidando e somando** códigos repetidos entre as páginas.
-  - **📋 Colar Imagem (`Ctrl+V`):** cola imagens direto do WhatsApp Web (ou arquivos copiados no Explorer) **acumulando** os novos itens ao final da tabela.
-  - **🗑️ Limpar Lista:** zera a tabela para começar um novo lote.
-- **Conferência e Edição Rápida na Tabela:**
-  - **Duplo clique** em qualquer linha abre a janela para editar **Código (Produto)**, **Valor Unitário**, **Local de Destino**, **Quantidade Final**, marcação de rasura, observação e status.
-  - **Atalhos na tabela:** selecionar uma linha e digitar um número altera a quantidade na hora; `+` e `-` somam ou subtraem 1; `Delete` remove linhas selecionadas.
-- **Robô Digitador para o WK Radar (Entrada da Produção):**
-  - Contagem regressiva de **10 segundos** para posicionar o mouse sobre o campo **OPERAÇÃO** no WK Radar.
-  - Captura a posição do campo **OPERAÇÃO** e preenche item por item usando `pyperclip` + `Ctrl+V` (sem erros de acentuação/cedilha).
-  - Marca em tempo real cada linha concluída com **`✅ Digitado`** (fundo verde `#d4edda`).
-  - Permite **▶️ Digitar da Linha Selecionada** para retomar um lote do ponto exato onde parou.
-  - **Painel de calibração na janela:** ajuste rápido de `Espera após salvar (s)` (padrão `1.5s`) e `Tecla para gravar` (`ENTER` ou `F2`).
-  - **Atalhos globais de segurança** (funcionam mesmo com a janela do WK Radar em foco):
-    - `F12`: **Pausar / Retomar** a digitação.
-    - `Esc`: **Parar** a digitação imediatamente.
-    - **Fail-Safe do PyAutoGUI:** jogar o mouse para o canto superior esquerdo da tela aborta a execução.
+### 📄 Leitura Rápida, Auditada e Sem Perdas (PDF + Imagens)
+- **Extração Nativa em Alta Velocidade (`pypdfium2` + `pdfplumber`):**
+  - **Via expressa em C++ (`pypdfium2`):** lê relatórios PDF digitais instantaneamente (10 PDFs / 430 linhas em menos de 1 segundo) e valida linha por linha contra o total de itens com preço da página.
+  - **Fallback estrutural (`pdfplumber`):** se alguma página divergir na contagem ou variar o formato, extrai automaticamente pelas tabelas com **herança de cabeçalho entre páginas**, limpeza de quebras de linha dentro das células e **auditoria automática** (avisa página e arquivo caso falte alguma linha ou haja página escaneada sem texto).
+  - **Lotes em paralelo (`ThreadPoolExecutor`):** ao abrir vários PDFs de uma vez, processa em paralelo mantendo a ordem original na tabela; se um arquivo do lote estiver corrompido, os demais continuam e o erro aparece resumido no aviso final.
+  - **Fallback com IA (Google Gemini, `temperature=0.0`):** usado automaticamente para PDFs totalmente escaneados, fotos enviadas por arquivo ou imagens coladas da área de transferência.
+- **Regras de Extração e Limpeza:**
+  - **Filtro de `TESTE`:** descarta automaticamente linhas cuja referência/linha contenha a palavra isolada `TESTE` (ex.: `3.28.053 TESTE_0225`), exibindo no resumo quantos itens foram ignorados.
+  - **Normalização de Código:** remove letras de prefixo no início antes dos números (ex.: `L3.28.051` → `3.28.051`), preservando pontos, barras, hífens e letras no meio/final (`3.12.084D`), apenas na leitura inicial (edições manuais na tabela são preservadas).
+  - **Sem Agrupamento de Repetidos:** cada linha do relatório permanece independente (identificada por `uid` único), mantendo exatamente a ordem e as ocorrências originais sem somar quantidades de códigos iguais.
+
+### 🧮 Cálculo Exato de Dobra e Coluna `Observação`
+- **Cálculo em `Decimal` (`ROUND_HALF_UP`):**
+  - Coluna `Dobra` vazia ou em branco é normalizada automaticamente para **`NÃO`**; somente **`SIM`** explícito aplica o acréscimo de dobra.
+  - Fórmula: `Valor Unitário = Preço Base + (Peso × Fator Dobra)` quando `Dobra == "SIM"`, ou apenas `Preço Base` quando `Dobra == "NÃO"` (fallback `"0,00"`).
+  - O `preco_base` original fica protegido em `Decimal` dentro de cada item, permitindo alterar **`Fator Dobra`** (padrão `1,2`), **`Dobra`** ou **`Peso`** a qualquer momento sem nunca somar o acréscimo duas vezes.
+- **Coluna Informativa `Observação`:**
+  - Para peças com `Dobra == "SIM"`, exibe o detalhamento: ``Original: R$ 43,77 + Dobra: R$ 4,70 → Final: R$ 48,47``.
+  - Para peças com `Dobra == "NÃO"`, permanece em branco.
+  - Coluna exclusivamente informativa (não editável por duplo clique na célula e não enviada ao WK Radar). Se o `Valor Unitário` for alterado manualmente, atualiza apenas o trecho `→ Final: R$ ...`.
+
+### 🖥️ Conferência e Edição na Tabela (8 Colunas)
+Colunas: **`Código` | `Dobra` | `Peso (kg)` | `Valor Unitário` | `Destino` | `Quantidade` | `Status` | `Observação`**
+
+- **Legenda de cores:**
+  - Azul claro (`#e7f3ff`): item com `Dobra == "SIM"`.
+  - Verde claro (`#d4edda`): item já lançado (`✅ Lançado` / `✅ Resolvida manual`).
+  - Laranja claro (`#ffe5b4`): pulado automaticamente por não estar cadastrado (`⏭️ Não cadastrado`).
+  - Vermelho claro (`#f8d7da`): pausado por pop-up (`⚠️ Falta de material` ou `⚠️ Pop-up detectado`).
+- **Atalhos e edição:**
+  - **📂 Abrir PDF / Foto(s):** aceita múltiplos arquivos `.pdf`, `.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`, `.tif`, `.tiff`.
+  - **📋 Colar Imagem (`Ctrl+V`):** cola imagens direto do WhatsApp Web ou arquivos copiados no Explorer (acumulando ao final da lista).
+  - **Duplo clique** nas colunas `#1` a `#6` (ou tecla `F2`) abre o diálogo completo (Código, Dobra, Preço Base, Peso, Valor Unitário, Destino, Quantidade, prévia da Observação e Status); duplo clique em **Status** (`#7`) alterna `✅ Lançado`.
+  - **Teclas rápidas na tabela:** digitar número edita `Quantidade`; `+` / `-` somam ou subtraem `1`; `Delete` remove linhas; **botão direito** abre o menu de contexto (incluindo alternar dobra, editar células e **▶️ Digitar a partir desta linha**).
+
+### 🤖 Robô Digitador no WK Radar (Calibração, Digitação Segura e Pop-ups)
+- **Calibração Persistente em 2 Pontos (`config.json`):**
+  - Clique em **`🎯 Calibrar Posições`** apenas uma vez: contagem em 2 etapas de **5s + 5s** (com aviso sonoro) para gravar as coordenadas dos campos **Operação** e **Produto** e o identificador da janela do WK Radar, salvando tudo em `config.json`.
+  - Indicador visual **`✅ Calibrado`** / **`⚠️ Não calibrado`**, com início imediato ao clicar em **`▶ Digitar no WK Radar`** ou **`▶️ Da Linha Selecionada`**.
+- **Parâmetros Configuráveis no Painel:**
+  - `Setas Operação` (padrão `1`)
+  - `Fator Dobra` (padrão `1,2`, recalcula a tabela em tempo real)
+  - `Espera Produto (s)` (padrão `1.0`, aguarda consulta do banco no WK Radar)
+  - `Enters até OK` (padrão `18`)
+  - `Espera OK (s)` (padrão `1.5`, monitoramento ativo pós-OK)
+- **Digitação Direta Segura (`digitar_campo_seguro`):**
+  - Limpa cada campo via Win32 (`keybd_event` com scan codes reais e `KEYEVENTF_EXTENDEDKEY`, imune ao **NumLock** ligado) e digita direto via `pyautogui.write` para códigos/números simples (usando `pyperclip` + `Ctrl+V` apenas como fallback para caracteres especiais). `Local de Destino` usa padrão `"23"`.
+- **Classificação Híbrida de Pop-ups (`classificar_popup`):**
+  - **Camada 1 (instantânea):** lê título e controles filhos da janela via `ctypes` (`GetWindowTextW` / `EnumChildWindows`).
+  - **Camada 2 (fallback em RAM):** captura recorte da caixa de aviso apenas em memória RAM (sem gravar arquivos em disco) e consulta o Gemini.
+  - **`NAO_CADASTRADO`:** fecha o aviso (`Esc` / `Enter`), apaga o código inválido no próprio campo **Produto** sem disparar loop de `OnExit` ao sair do campo, marca a linha em laranja (`⏭️ Não cadastrado`), mantém a Operação já selecionada e pula automaticamente para a próxima peça.
+  - **`FALTA_MATERIAL` ou `OUTRO`:** pausa com alerta sonoro, destaca em vermelho, restaura a janela do app e habilita os botões **`▶ Continuar da Próxima Peça`** e **`🔁 Repetir Peça Pausada`**.
+- **Atalhos Globais de Segurança:** `F12` (**Pausar / Retomar**), `Esc` (**Parar**) e **Fail-Safe** do PyAutoGUI (mover o mouse para o canto superior esquerdo aborta na hora).
 
 ---
 
@@ -35,7 +67,7 @@ Aplicação desktop em Python (`tkinter`) para Windows que lê fotos de folhas d
 ### 1. Pré-requisitos
 - Windows 10 ou 11
 - Python 3.11+ (testado com Python 3.12)
-- Uma chave de API do Google Gemini ([Google AI Studio](https://aistudio.google.com/apikey))
+- Chave de API do Google Gemini ([Google AI Studio](https://aistudio.google.com/apikey)) — necessária apenas para leitura de fotos, PDFs escaneados ou fallback visual de pop-ups (PDFs digitais rodam 100% localmente)
 
 ### 2. Criar o ambiente virtual e instalar dependências
 
@@ -47,7 +79,7 @@ pip install -r requirements.txt
 
 ### 3. Configurar a chave da API (`.env`)
 
-Copie o arquivo `.env.example` para `.env` e coloque sua chave:
+Copie o arquivo `.env.example` para `.env` e informe sua chave:
 
 ```env
 GEMINI_API_KEY=sua_chave_aqui
@@ -69,17 +101,15 @@ Execute o script [gerar_exe.bat](gerar_exe.bat) com duplo clique ou pelo termina
 .\gerar_exe.bat
 ```
 
-O executável será gerado em `dist\LeitorCorteLaser.exe` (o script já copia o arquivo `.env` automaticamente para a pasta `dist\`).
+O script encerra automaticamente qualquer `LeitorCorteLaser.exe` que esteja aberto, executa um build limpo (`pyinstaller --clean --noconfirm --onefile --windowed`) e gera o executável em `dist\LeitorCorteLaser.exe` (copiando o `.env` para `dist\.env`).
 
-> **Importante:** se você levar o `LeitorCorteLaser.exe` para outro computador, mantenha o arquivo `.env` na mesma pasta do `.exe`.
+> **Importante:** ao mover o `LeitorCorteLaser.exe` para outra pasta ou computador, mantenha o arquivo `.env` na mesma pasta do `.exe`. As posições calibradas e parâmetros são salvos automaticamente em `config.json` ao lado do executável.
 
 ---
 
 ## ⌨️ Como Usar com o WK Radar
 
-1. Abra ou cole (`Ctrl+V`) as fotos das folhas de controle de corte a laser.
-2. Confira os itens na tabela (especialmente as **linhas amarelas** com rasura à caneta).
-3. Ajuste, se necessário, o tempo de **`Espera após salvar (s)`** (`1.5s`) e a **`Tecla para gravar`** (`ENTER` ou `F2`).
-4. Clique em **`⌨️ Digitar no WK Radar (10s)`** (ou **`▶️ Digitar da Linha Selecionada (10s)`**).
-5. Durante os 10 segundos de contagem regressiva, **clique no campo `OPERAÇÃO` no WK Radar e deixe o mouse parado sobre ele**.
-6. Ao final da contagem, o robô captura a posição do campo `OPERAÇÃO` e lança automaticamente todas as peças pendentes.
+1. Abra os relatórios **PDF** ou cole imagens (`Ctrl+V`) em **`📂 Abrir PDF / Foto(s)`**.
+2. Confira na tabela a coluna **`Dobra`**, o **`Valor Unitário`** calculado e o detalhamento na coluna **`Observação`**.
+3. Na primeira vez (ou se mudar a resolução/posição da janela), deixe a tela de **Entrada da Produção** do WK Radar aberta, clique em **`🎯 Calibrar Posições`** e posicione o mouse sobre **Operação** (5s) e depois sobre **Produto** (5s). A calibração fica salva em `config.json`.
+4. Com o WK Radar aberto atrás, clique em **`▶ Digitar no WK Radar`** (ou selecione uma linha e clique em **`▶️ Da Linha Selecionada`**) para iniciar os lançamentos automaticamente.
