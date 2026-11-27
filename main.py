@@ -8,6 +8,7 @@ Entrada da Produção do ERP WK Radar.
 """
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import ctypes
 import ctypes.wintypes
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -24,6 +25,10 @@ import uuid
 import winsound
 
 import pdfplumber
+try:
+    import pypdfium2
+except ImportError:
+    pypdfium2 = None
 import pyautogui
 import pyperclip
 from dotenv import load_dotenv
@@ -748,6 +753,36 @@ def _parse_int_seguro(valor, padrao: int | None = None) -> int | None:
         return padrao
 
 
+def _limpar_texto_celula(valor) -> str:
+    """Remove quebras de linha, tabs e espaços múltiplos dentro da célula do PDF."""
+    return re.sub(r"\s+", " ", str(valor or "")).strip()
+
+
+def _contem_palavra_teste(texto) -> bool:
+    """Detecta 'teste' como token isolado (ex.: 'TESTE_0225'), evitando falsos positivos."""
+    return bool(
+        re.search(r"(?<![A-Za-zÀ-ÿ])teste(?![A-Za-zÀ-ÿ])", str(texto or ""), re.IGNORECASE)
+    )
+
+
+def _contar_linhas_peca_texto(texto_pagina: str) -> int:
+    """Conta linhas no texto da página que aparentam ser peças com preço (R$)."""
+    total = 0
+    termos_resumo = ("total", "subtotal", "resumo", "custo", "valor total")
+    for linha in (texto_pagina or "").splitlines():
+        linha_limpa = linha.strip()
+        if not linha_limpa:
+            continue
+        if linha_limpa.lower().startswith(termos_resumo):
+            continue
+        if re.search(r"r\$\s*[\d.,]+", linha_limpa, re.IGNORECASE) and (
+            re.match(r"^\s*\d+\s+", linha_limpa)
+            or re.search(r"[\d.,]+\s*x\s*[\d.,]+", linha_limpa, re.IGNORECASE)
+        ):
+            total += 1
+    return total
+
+
 def _montar_item_corte(
     codigo_bruto: str,
     dobra_bruta,
@@ -758,10 +793,10 @@ def _montar_item_corte(
     texto_linha_bruta: str = "",
 ) -> ItemCorte | None:
     """Constrói ItemCorte independente (sem agrupar) ou None se for item de TESTE."""
-    ref_raw = str(codigo_bruto or "").strip()
+    ref_raw = _limpar_texto_celula(codigo_bruto)
     if not ref_raw:
         return None
-    if "teste" in ref_raw.lower() or "teste" in str(texto_linha_bruta or "").lower():
+    if _contem_palavra_teste(ref_raw) or _contem_palavra_teste(texto_linha_bruta):
         return None
 
     codigo_limpo = normalizar_codigo(ref_raw)
@@ -793,16 +828,24 @@ def _normalizar_cabecalho(celula) -> str:
     return re.sub(r"\s+", " ", str(celula or "").replace("\n", " ")).strip().lower()
 
 
-def _extrair_itens_tabelas_pagina(pagina, fator_dobra, stats: dict | None = None) -> list[ItemCorte]:
+def _extrair_itens_tabelas_pagina(
+    pagina,
+    fator_dobra,
+    stats: dict | None = None,
+    mapa_cols_herdado: dict[str, int] | None = None,
+) -> tuple[list[ItemCorte], dict[str, int] | None]:
     """Extrai linhas de corte via `extract_tables()` de uma página pdfplumber."""
     itens: list[ItemCorte] = []
     tabelas = pagina.extract_tables() or []
+    mapa_ultimo: dict[str, int] | None = (
+        dict(mapa_cols_herdado) if mapa_cols_herdado else None
+    )
     for tabela in tabelas:
         mapa_cols: dict[str, int] | None = None
         for linha in tabela:
             if not linha:
                 continue
-            celulas = [str(c or "").strip() for c in linha]
+            celulas = [_limpar_texto_celula(c) for c in linha]
             if not any(celulas):
                 continue
 
@@ -826,52 +869,68 @@ def _extrair_itens_tabelas_pagina(pagina, fator_dobra, stats: dict | None = None
                         mapa_cols["pedido"] = i
                     elif "peso" in h and "peso" not in mapa_cols:
                         mapa_cols["peso"] = i
+                mapa_ultimo = dict(mapa_cols)
                 continue
 
-            if not mapa_cols:
+            mapa_ativo = mapa_cols
+            eh_herdado = False
+            if mapa_ativo is None and mapa_cols_herdado:
+                mapa_ativo = mapa_cols_herdado
+                eh_herdado = True
+
+            if not mapa_ativo:
                 continue
 
-            idx_ref = mapa_cols["ref"]
+            idx_ref = mapa_ativo["ref"]
             if idx_ref >= len(celulas):
                 continue
-            ref_bruta = celulas[idx_ref].strip()
+            if eh_herdado and len(celulas) <= max(mapa_ativo.values()):
+                continue
+
+            ref_bruta = celulas[idx_ref]
             if not ref_bruta:
                 continue
             if _normalizar_cabecalho(ref_bruta) in ("referência", "referencia"):
                 continue
 
+            preco_bruto = (
+                celulas[mapa_ativo["preco"]]
+                if "preco" in mapa_ativo and mapa_ativo["preco"] < len(celulas)
+                else ""
+            )
+            if eh_herdado and "preco" in mapa_ativo:
+                preco_txt = preco_bruto.strip().lower()
+                if "r$" not in preco_txt and not re.search(r"\d", preco_txt):
+                    continue
+
+            qtd_bruta = (
+                celulas[mapa_ativo["qtd"]]
+                if "qtd" in mapa_ativo and mapa_ativo["qtd"] < len(celulas)
+                else ""
+            )
+            if not qtd_bruta.strip() and "pedido" in mapa_ativo and mapa_ativo["pedido"] < len(celulas):
+                qtd_bruta = celulas[mapa_ativo["pedido"]]
+
+            qtd = _parse_int_seguro(qtd_bruta)
+            if qtd is None:
+                continue
+
             texto_linha = " ".join(c for c in celulas if c)
-            if "teste" in ref_bruta.lower() or "teste" in texto_linha.lower():
+            if _contem_palavra_teste(ref_bruta) or _contem_palavra_teste(texto_linha):
                 if stats is not None:
                     stats["ignorados_teste"] = stats.get("ignorados_teste", 0) + 1
                 continue
 
             dobra_bruta = (
-                celulas[mapa_cols["dobra"]]
-                if "dobra" in mapa_cols and mapa_cols["dobra"] < len(celulas)
-                else ""
-            )
-            preco_bruto = (
-                celulas[mapa_cols["preco"]]
-                if "preco" in mapa_cols and mapa_cols["preco"] < len(celulas)
+                celulas[mapa_ativo["dobra"]]
+                if "dobra" in mapa_ativo and mapa_ativo["dobra"] < len(celulas)
                 else ""
             )
             peso_bruto = (
-                celulas[mapa_cols["peso"]]
-                if "peso" in mapa_cols and mapa_cols["peso"] < len(celulas)
+                celulas[mapa_ativo["peso"]]
+                if "peso" in mapa_ativo and mapa_ativo["peso"] < len(celulas)
                 else "0"
             )
-            qtd_bruta = (
-                celulas[mapa_cols["qtd"]]
-                if "qtd" in mapa_cols and mapa_cols["qtd"] < len(celulas)
-                else ""
-            )
-            if not qtd_bruta.strip() and "pedido" in mapa_cols and mapa_cols["pedido"] < len(celulas):
-                qtd_bruta = celulas[mapa_cols["pedido"]]
-
-            qtd = _parse_int_seguro(qtd_bruta)
-            if qtd is None:
-                continue
 
             item = _montar_item_corte(
                 ref_bruta,
@@ -885,7 +944,7 @@ def _extrair_itens_tabelas_pagina(pagina, fator_dobra, stats: dict | None = None
             if item is not None:
                 itens.append(item)
 
-    return itens
+    return itens, mapa_ultimo
 
 
 def _extrair_texto_pdf_regex(texto_pagina: str, fator_dobra, stats: dict | None = None) -> list[ItemCorte]:
@@ -909,8 +968,8 @@ def _extrair_texto_pdf_regex(texto_pagina: str, fator_dobra, stats: dict | None 
         m = padrao.match(linha)
         if not m:
             continue
-        ref_bruta = m.group("ref").strip()
-        if "teste" in ref_bruta.lower() or "teste" in linha.lower():
+        ref_bruta = _limpar_texto_celula(m.group("ref"))
+        if _contem_palavra_teste(ref_bruta) or _contem_palavra_teste(linha):
             if stats is not None:
                 stats["ignorados_teste"] = stats.get("ignorados_teste", 0) + 1
             continue
@@ -1009,7 +1068,7 @@ def _converter_brutos_em_itens(
     """Filtra 'teste', limpa prefixos/dobra e calcula valor_unitario sem agrupar."""
     resultado: list[ItemCorte] = []
     for bruto in brutos:
-        if "teste" in str(bruto.codigo or "").lower():
+        if _contem_palavra_teste(bruto.codigo):
             if stats is not None:
                 stats["ignorados_teste"] = stats.get("ignorados_teste", 0) + 1
             continue
@@ -1026,27 +1085,124 @@ def _converter_brutos_em_itens(
     return resultado
 
 
+_LOCK_PDFIUM = threading.Lock()
+
+
+def _extrair_pdf_rapido_pypdfium2(
+    caminho_pdf: str, fator_dobra=FATOR_DOBRA_PADRAO
+) -> tuple[list[ItemCorte], int] | None:
+    """Via rápida via PDFium (C++): extrai texto e valida todas as linhas contra o contador."""
+    if pypdfium2 is None or not os.path.isfile(caminho_pdf):
+        return None
+    try:
+        with _LOCK_PDFIUM:
+            itens: list[ItemCorte] = []
+            ign_total = 0
+            doc = pypdfium2.PdfDocument(caminho_pdf)
+            try:
+                for i in range(len(doc)):
+                    page = doc[i]
+                    try:
+                        tp = page.get_textpage()
+                        try:
+                            texto_pag = tp.get_text_bounded() or ""
+                        finally:
+                            tp.close()
+                    finally:
+                        page.close()
+
+                    if not texto_pag.strip():
+                        return None
+                    esperadas = _contar_linhas_peca_texto(texto_pag)
+                    st_pag = {"ignorados_teste": 0}
+                    extraidos_pag = _extrair_texto_pdf_regex(
+                        texto_pag, fator_dobra, stats=st_pag
+                    )
+                    lidas_pag = len(extraidos_pag) + st_pag["ignorados_teste"]
+                    if esperadas > 0 and lidas_pag != esperadas:
+                        return None
+                    itens.extend(extraidos_pag)
+                    ign_total += st_pag["ignorados_teste"]
+            finally:
+                doc.close()
+            return (itens, ign_total) if itens else None
+    except Exception:
+        return None
+
+
 def extrair_itens_pdf(
     caminho_pdf: str,
     fator_dobra=FATOR_DOBRA_PADRAO,
     aviso=None,
     stats: dict | None = None,
 ) -> list[ItemCorte]:
-    """Extrai peças de PDF via `pdfplumber` (prioritário) com fallback automático para Gemini."""
+    """Extrai peças de PDF (via rápida PDFium -> pdfplumber -> fallback Gemini)."""
+    rapido = _extrair_pdf_rapido_pypdfium2(caminho_pdf, fator_dobra)
+    if rapido is not None:
+        itens_rapidos, ign_rapidos = rapido
+        if stats is not None:
+            stats["ignorados_teste"] = stats.get("ignorados_teste", 0) + ign_rapidos
+        return itens_rapidos
+
     itens: list[ItemCorte] = []
+    nome_arq = os.path.basename(caminho_pdf)
+    mapa_cols_atual: dict[str, int] | None = None
+    paginas_escaneadas: list[int] = []
+
     with pdfplumber.open(caminho_pdf) as pdf:
-        for pagina in pdf.pages:
-            extraidos = _extrair_itens_tabelas_pagina(pagina, fator_dobra, stats=stats)
-            if not extraidos:
-                extraidos = _extrair_texto_pdf_regex(
-                    pagina.extract_text() or "", fator_dobra, stats=stats
+        for num_pag, pagina in enumerate(pdf.pages, start=1):
+            texto_pag = pagina.extract_text() or ""
+            esperadas = _contar_linhas_peca_texto(texto_pag)
+
+            stats_tab = {"ignorados_teste": 0}
+            extraidos_pag, novo_mapa = _extrair_itens_tabelas_pagina(
+                pagina,
+                fator_dobra,
+                stats=stats_tab,
+                mapa_cols_herdado=mapa_cols_atual,
+            )
+            if novo_mapa is not None:
+                mapa_cols_atual = novo_mapa
+            ign_pag = stats_tab["ignorados_teste"]
+
+            if not extraidos_pag or esperadas > len(extraidos_pag) + ign_pag:
+                stats_rx = {"ignorados_teste": 0}
+                extraidos_rx = _extrair_texto_pdf_regex(
+                    texto_pag, fator_dobra, stats=stats_rx
                 )
-            itens.extend(extraidos)
+                if len(extraidos_rx) + stats_rx["ignorados_teste"] > len(extraidos_pag) + ign_pag:
+                    extraidos_pag = extraidos_rx
+                    ign_pag = stats_rx["ignorados_teste"]
+
+            if stats is not None:
+                stats["ignorados_teste"] = stats.get("ignorados_teste", 0) + ign_pag
+            itens.extend(extraidos_pag)
+
+            total_lidas = len(extraidos_pag) + ign_pag
+            if esperadas > total_lidas:
+                if stats is not None:
+                    stats.setdefault("avisos_auditoria", []).append(
+                        f"{nome_arq} (pág. {num_pag}): {esperadas} linha(s) com preço "
+                        f"detectadas no texto, mas {total_lidas} processada(s) — confira esta página."
+                    )
+            elif not extraidos_pag and not ign_pag and not texto_pag.strip():
+                paginas_escaneadas.append(num_pag)
 
     if itens:
+        if paginas_escaneadas and stats is not None:
+            pags_fmt = ", ".join(map(str, paginas_escaneadas))
+            stats.setdefault("avisos_auditoria", []).append(
+                f"{nome_arq}: página(s) {pags_fmt} sem texto selecionável "
+                "(possível imagem escaneada) — confira ou envie como foto."
+            )
         return itens
 
     # Fallback automático para PDF escaneado / sem tabela extraível via pdfplumber
+    if stats is not None:
+        stats.setdefault("avisos_auditoria", []).append(
+            f"{nome_arq}: PDF sem texto selecionável lido via IA (Gemini) "
+            "— recomenda-se conferência visual dos códigos e valores."
+        )
     if aviso:
         aviso("⏳ PDF sem tabela selecionável. Lendo com Gemini...")
     with open(caminho_pdf, "rb") as arq:
@@ -1779,13 +1935,16 @@ class App:
     def _processar_entradas(self, entradas: list[tuple[str, object]], acumular: bool):
         fator_dobra = self._ler_fator_dobra()
         self._set_ocupado(True, modo="ia")
-        self._set_status(f"⏳ Lendo {len(entradas)} arquivo(s)... aguarde.")
+        total_ent = len(entradas)
+        self._set_status(f"⏳ Lendo {total_ent} arquivo(s)... aguarde.")
 
         def tarefa():
             try:
-                stats = {"ignorados_teste": 0}
+                stats: dict = {"ignorados_teste": 0, "avisos_auditoria": []}
                 novos: list[ItemCorte] = []
                 lote_imgs: list[Image.Image] = []
+                lote_pdfs: list[str] = []
+                erros_arquivos: list[str] = []
                 aviso_fn = lambda m: self.root.after(0, self._set_status, m)
 
                 def _flush_imagens():
@@ -1798,28 +1957,103 @@ class App:
                         )
                         lote_imgs.clear()
 
+                def _flush_pdfs():
+                    if not lote_pdfs:
+                        return
+                    qtd_pdfs = len(lote_pdfs)
+                    if qtd_pdfs == 1:
+                        caminho_pdf = lote_pdfs[0]
+                        nome_pdf = os.path.basename(caminho_pdf)
+                        aviso_fn(f"⏳ Lendo PDF: {nome_pdf}...")
+                        try:
+                            novos.extend(
+                                extrair_itens_pdf(
+                                    caminho_pdf, fator_dobra=fator_dobra,
+                                    aviso=aviso_fn, stats=stats,
+                                )
+                            )
+                        except Exception as exc:
+                            if total_ent == 1:
+                                raise
+                            erros_arquivos.append(f"{nome_pdf}: {exc}")
+                        finally:
+                            lote_pdfs.clear()
+                        return
+
+                    aviso_fn(f"⏳ Lendo {qtd_pdfs} PDF(s) em paralelo...")
+                    resultados: list[tuple[list[ItemCorte], dict, str | None]] = [
+                        ([], {}, None) for _ in range(qtd_pdfs)
+                    ]
+
+                    def _ler_um(indice: int, caminho_pdf: str):
+                        st_local: dict = {"ignorados_teste": 0, "avisos_auditoria": []}
+                        try:
+                            itens_pdf = extrair_itens_pdf(
+                                caminho_pdf, fator_dobra=fator_dobra,
+                                aviso=None, stats=st_local,
+                            )
+                            return indice, itens_pdf, st_local, None
+                        except Exception as exc:
+                            return indice, [], st_local, f"{os.path.basename(caminho_pdf)}: {exc}"
+
+                    concluidos = 0
+                    with ThreadPoolExecutor(max_workers=min(4, qtd_pdfs)) as pool:
+                        futuros = [
+                            pool.submit(_ler_um, i, c) for i, c in enumerate(lote_pdfs)
+                        ]
+                        for fut in as_completed(futuros):
+                            idx_res, itens_res, st_res, err_res = fut.result()
+                            resultados[idx_res] = (itens_res, st_res, err_res)
+                            concluidos += 1
+                            nome_pdf = os.path.basename(lote_pdfs[idx_res])
+                            aviso_fn(f"⏳ Lendo PDFs ({concluidos}/{qtd_pdfs}): {nome_pdf}...")
+
+                    for itens_res, st_res, err_res in resultados:
+                        if err_res:
+                            erros_arquivos.append(err_res)
+                        else:
+                            novos.extend(itens_res)
+                            stats["ignorados_teste"] += st_res.get("ignorados_teste", 0)
+                            stats["avisos_auditoria"].extend(
+                                st_res.get("avisos_auditoria", [])
+                            )
+                    lote_pdfs.clear()
+
                 for tipo, dado in entradas:
                     if tipo == "pdf":
                         _flush_imagens()
-                        novos.extend(
-                            extrair_itens_pdf(
-                                str(dado), fator_dobra=fator_dobra,
-                                aviso=aviso_fn, stats=stats,
-                            )
-                        )
+                        lote_pdfs.append(str(dado))
                     else:
+                        _flush_pdfs()
                         lote_imgs.append(dado)  # type: ignore[arg-type]
+                _flush_pdfs()
                 _flush_imagens()
 
+                if not novos and erros_arquivos:
+                    raise RuntimeError(
+                        "Não foi possível ler os arquivos selecionados:\n\n"
+                        + "\n".join(f"• {e}" for e in erros_arquivos)
+                    )
+
+                avisos = list(stats.get("avisos_auditoria", [])) + [
+                    f"Erro ao ler {e}" for e in erros_arquivos
+                ]
                 self.root.after(
-                    0, self._leitura_ok, novos, acumular, stats["ignorados_teste"]
+                    0, self._leitura_ok, novos, acumular,
+                    stats["ignorados_teste"], avisos,
                 )
             except Exception as e:
                 self.root.after(0, self._leitura_erro, e)
 
         threading.Thread(target=tarefa, daemon=True).start()
 
-    def _leitura_ok(self, novos: list[ItemCorte], acumular: bool, ignorados_teste: int = 0):
+    def _leitura_ok(
+        self,
+        novos: list[ItemCorte],
+        acumular: bool,
+        ignorados_teste: int = 0,
+        avisos: list[str] | None = None,
+    ):
         if acumular:
             self.itens.extend(novos)
             self._ignorados_teste_lote += ignorados_teste
@@ -1831,7 +2065,16 @@ class App:
         self._set_ocupado(False)
         modo = "adicionados ao final" if acumular else "carregados"
         extra = f" ({ignorados_teste} TESTE ignorado(s))" if ignorados_teste else ""
-        self._set_status(f"✅ {len(novos)} itens {modo}{extra}.")
+        if avisos:
+            self._set_status(
+                f"⚠️ {len(novos)} itens {modo}{extra} — {len(avisos)} aviso(s) de conferência."
+            )
+            messagebox.showwarning(
+                "Conferência recomendada na leitura do PDF",
+                "\n".join(f"• {a}" for a in avisos),
+            )
+        else:
+            self._set_status(f"✅ {len(novos)} itens {modo}{extra}.")
 
     def _leitura_erro(self, erro: Exception):
         self._set_ocupado(False)
