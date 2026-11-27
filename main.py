@@ -9,6 +9,8 @@ Entrada da Produção do ERP WK Radar.
 
 import base64
 import ctypes
+import ctypes.wintypes
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import io
 import json
 import os
@@ -18,8 +20,10 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import uuid
 import winsound
 
+import pdfplumber
 import pyautogui
 import pyperclip
 from dotenv import load_dotenv
@@ -43,15 +47,18 @@ TEMPO_LIMITE_IA = 60
 CONTAGEM_SEGUNDOS = 10          # tempo total da calibração (5s + 5s)
 CONTAGEM_ETAPA_SEGUNDOS = 5     # segundos por etapa (1/2 Operação, 2/2 Produto)
 SETAS_OPERACAO_PADRAO = 1       # toques na seta p/ baixo no campo Operação
+FATOR_DOBRA_PADRAO = Decimal("1.2")  # acréscimo R$/kg quando Dobra == "SIM"
 ESPERA_APOS_PRODUTO = 1.0       # tempo (s) após Enter do Produto p/ consulta no banco
 ENTERS_APOS_QTD_PADRAO = 18     # Enters finais até OK + confirmação do OK
 ESPERA_APOS_OK = 1.5            # tempo (s) para salvar e limpar o formulário
 VALOR_UNITARIO_PADRAO = "0,00"
 LOCAL_DESTINO_PADRAO = "23"
 
-COR_ALTERADO = "#fff3cd"        # fundo amarelo claro das linhas com rasura à caneta
+COR_DOBRA_SIM = "#e7f3ff"       # fundo azul claro suave para itens com Dobra == SIM
+COR_ALTERADO = "#fff3cd"        # fundo amarelo claro para anotações manuais
 COR_LANCADO = "#d4edda"         # fundo verde claro das linhas já lançadas (✅)
 COR_POPUP = "#f8d7da"           # fundo vermelho claro quando abre pop-up no WK Radar
+COR_NAO_CADASTRADO = "#ffe5b4"  # fundo laranja claro quando produto não cadastrado
 TAMANHO_MAX_IMAGEM = 2400       # px (maior lado) antes de enviar para a API
 
 # Códigos de tecla virtual do Windows (atalhos globais via user32.GetAsyncKeyState)
@@ -87,38 +94,67 @@ CAMINHO_CONFIG = os.path.join(PASTA_BASE, "config.json")
 # =============================================================================
 # SCHEMA (Structured Outputs com Pydantic)
 # =============================================================================
+class ItemBrutoGemini(BaseModel):
+    codigo: str = Field(
+        description="Código da peça na coluna 'Referência' (sem letras iniciais de "
+                    "prefixo antes dos números, mantendo pontos, hífens e letras finais)."
+    )
+    dobra: str = Field(
+        default="NÃO",
+        description="Conteúdo da coluna 'Dobra': retorne 'SIM' apenas quando explícito; "
+                    "se vier vazio, em branco ou NÃO, retorne 'NÃO'."
+    )
+    preco_base: str = Field(
+        default="0,00",
+        description="Preço bruto da coluna 'Preço' sem o 'R$' (ex.: '43.77', '16.754'). "
+                    "NÃO faça cálculos nem some peso."
+    )
+    peso: str = Field(
+        default="0",
+        description="Peso bruto da coluna 'Peso / KG' (ex.: '3.92', '0.71'). Use '0' se vazio."
+    )
+    quantidade: int = Field(
+        description="Quantidade inteira da peça ('Qtd Peças' ou fallback 'Pedido'). "
+                    "Se houver número corrigido à caneta, priorize-o."
+    )
+
+
+class ResultadoLeituraBruta(BaseModel):
+    itens: list[ItemBrutoGemini] = Field(
+        description="Cada linha válida da folha como objeto separado, sem agrupar."
+    )
+
+
 class ItemCorte(BaseModel):
+    uid: SkipJsonSchema[str] = Field(
+        default_factory=lambda: uuid.uuid4().hex, exclude=True
+    )
     codigo: str = Field(
         description="Código da peça impresso na folha (sem letras de prefixo no início "
                     "antes do número, mantendo pontos, hífens, barras, espaços internos e "
                     "letras no meio ou no final do código)."
     )
+    dobra: str = Field(default="NÃO")
+    preco_base: str = Field(default=VALOR_UNITARIO_PADRAO)
+    peso: str = Field(default="0")
     valor_unitario: str = Field(
         default=VALOR_UNITARIO_PADRAO,
-        description="Preço / valor unitário da peça na coluna 'Preço' (valores com 'R$'). "
-                    "O ponto (.) no preço impresso funciona como vírgula decimal (ex.: "
-                    "'R$ 199.906' = '199,90'; 'R$ 161.673' = '161,67'; 'R$ 10.97' = '10,97'). "
-                    "Retorne apenas o número com vírgula e 2 casas decimais (sem 'R$'). "
-                    "Se não houver preço na folha, use '0,00'."
+        description="Valor unitário final (com acréscimo de dobra quando aplicável)."
     )
+    valor_manual: SkipJsonSchema[bool] = Field(default=False, exclude=True)
     local_destino: str = Field(
         default=LOCAL_DESTINO_PADRAO,
-        description="Local de destino no estoque. Use sempre o valor padrão '23', "
-                    "a menos que outro destino esteja explicitamente indicado."
+        description="Local de destino no estoque. Use sempre o valor padrão '23'."
     )
     quantidade_final: int = Field(
-        description="Quantidade final da peça. Se a quantidade impressa estiver "
-                    "riscada/rasurada, priorize sempre o número escrito à caneta."
+        description="Quantidade final da peça."
     )
-    alterado_a_mao: bool = Field(
-        description="True se houve risco, rasura ou anotação manual na quantidade."
-    )
-    observacao: str = Field(
-        description="Nota breve sobre rasuras (ex.: 'Riscado 15, escrito 12 - queimou'). "
-                    "Vazio se não houver nada a observar."
-    )
+    alterado_a_mao: bool = Field(default=False)
+    observacao: str = Field(default="")
     lancado: SkipJsonSchema[bool] = Field(default=False, exclude=True)
     erro_popup: SkipJsonSchema[bool] = Field(default=False, exclude=True)
+    nao_cadastrado: SkipJsonSchema[bool] = Field(default=False, exclude=True)
+    tipo_popup: SkipJsonSchema[str] = Field(default="", exclude=True)
     resolvida_manual: SkipJsonSchema[bool] = Field(default=False, exclude=True)
 
     @field_validator("valor_unitario", mode="before")
@@ -134,60 +170,38 @@ class ResultadoLeitura(BaseModel):
 
 
 PROMPT_SISTEMA = """\
-Você é um assistente especialista em ler folhas de controle de corte a laser de uma \
-indústria metalúrgica brasileira. As folhas são fotografadas com celular e contêm uma \
-tabela impressa (com colunas como #, IMG, Referência, Dobra, Preço, Dimensões, \
-Peças/Pedido, Tempo, Peso/KG), muitas vezes com anotações, marca-texto, clipes/post-its \
-e rasuras feitas à caneta pelo operador.
+Você é um assistente especialista em extrair linhas de relatórios e fotos de folhas de \
+corte a laser (padrão HMAGRO / CypCut). Extraia APENAS os dados brutos em JSON, sem fazer \
+nenhum cálculo matemático.
 
 REGRAS OBRIGATÓRIAS:
-1. CÓDIGO ("codigo"): fica na coluna "Referência" (ex.: "3.24.031", "L3.12.084D", \
-"P3.27.133"). Ignore qualquer letra no início antes do código numérico (prefixos), \
-retornando sem essas letras iniciais (ex.: "L3.12.084D" -> "3.12.084D", \
-"P3.27.133" -> "3.27.133"), mas mantenha SEMPRE letras no meio ou no final do código \
-(como o "D" final em "3.12.084D"), além de pontos (.), hífens (-), barras (/), \
-underscores e zeros à esquerda. NÃO use o número da primeira coluna "#" como código.
-2. PREÇO / VALOR UNITÁRIO ("valor_unitario"):
-   - Fica na coluna "Preço" (os valores começam com "R$", mesmo que o título da coluna \
-esteja coberto por um clipe ou post-it).
-   - ATENÇÃO CRÍTICA: nessa folha, o PONTO (.) no preço funciona como VÍRGULA DECIMAL \
-(o software imprime 2 ou 3 casas decimais após o ponto). Portanto, NÃO é separador de \
-milhar!
-   - Exemplos reais:
-     * "R$ 199.906" significa 199 reais e 90 centavos -> retorne "199,90" (NUNCA 199 mil!).
-     * "R$ 161.673" -> retorne "161,67".
-     * "R$ 270.999" -> retorne "270,99".
-     * "R$ 3.927"   -> retorne "3,92".
-     * "R$ 10.97"   -> retorne "10,97".
-     * "R$ 1.65"    -> retorne "1,65".
-   - Sempre remova o "R$", troque o ponto por vírgula e mantenha APENAS as 2 primeiras \
-casas decimais (descarte a 3ª casa decimal sem arredondar para cima).
-   - Se o preço estiver riscado e corrigido à caneta, use o valor escrito à caneta.
-   - Só retorne "0,00" se a folha realmente não tiver coluna/valor de preço para a peça.
-3. QUANTIDADE ("quantidade_final") e RASURAS:
-   - A quantidade fica nas colunas "Peças" / "Pedido" (não confunda com a coluna "#" \
-nem com "Peso / KG" ou dimensões).
-   - Quando a quantidade original impressa estiver riscada, rasurada, circulada com \
-correção ou sobrescrita à caneta, SEMPRE priorize o número escrito à caneta \
-(geralmente peças que queimaram/perderam no corte). Nesse caso, marque \
-alterado_a_mao = true e descreva em "observacao" (ex.: "Riscado 15, escrito 12 - queimou").
-   - Traços ou vistos de conferência ("/") na coluna "Dobra" (SIM/NÃO) NÃO são rasuras \
-de quantidade. Se a quantidade não foi alterada à mão, marque alterado_a_mao = false.
-   - Se a correção à caneta indicar zero, ou a linha inteira estiver riscada \
-(peça cancelada), use quantidade_final = 0 e explique na observação.
-4. LOCAL DE DESTINO ("local_destino"): retorne sempre "23" como padrão.
-5. VÁRIAS FOLHAS: você pode receber 2 ou mais imagens do mesmo lote. Se o MESMO \
-código de peça aparecer repetido (na mesma folha ou entre folhas diferentes), \
-CONSOLIDE em um único item somando as quantidades finais. Mantenha \
-alterado_a_mao = true se QUALQUER uma das ocorrências tiver rasura, e mencione a \
-soma na observação (ex.: "somado: folha 1 = 5, folha 2 = 3").
-6. Se algum dígito estiver ilegível ou duvidoso, faça a melhor leitura possível e \
-registre a dúvida na observação.
-7. Não invente peças. Ignore cabeçalhos, totais, datas, assinaturas e campos que \
-não sejam linhas de peças.
-8. Mantenha a ordem em que as peças aparecem nas folhas.
-9. Deixe "observacao" como string vazia quando não houver nada relevante.
+1. FILTRO DE TESTE: IGNORE e NÃO inclua na lista nenhuma peça ou linha cuja referência \
+contenha a palavra "TESTE" (ex.: "3.28.053 TESTE_0225", ignorando maiúsculas/minúsculas).
+2. CÓDIGO ("codigo"): fica na coluna "Referência" (ex.: "3.11.334", "L3.28.051", \
+"3.12.084D"). Ignore letras no início antes do código numérico (prefixos), retornando \
+sem essas letras iniciais (ex.: "L3.28.051" -> "3.28.051"), mas mantenha SEMPRE letras no \
+meio ou no final (como "D" em "3.12.084D"), além de pontos, hífens e barras. NÃO use o \
+número da coluna "#".
+3. DOBRA ("dobra"): fica na coluna "Dobra". Se a célula estiver vazia, em branco ou "NÃO", \
+retorne exatamente "NÃO". Só retorne "SIM" se estiver explicitamente "SIM".
+4. PREÇO BASE ("preco_base") e PESO ("peso"):
+   - Extraia os valores brutos das colunas "Preço" (sem "R$", ex.: "43.77", "16.754") e \
+"Peso / KG" (ex.: "3.92"). NÃO faça cálculos — o programa calculará o acréscimo em Python.
+   - Se não houver preço, use "0,00". Se não houver peso, use "0".
+5. QUANTIDADE ("quantidade"): número inteiro da coluna "Qtd Peças" (ou da coluna \
+"Pedido" se "Qtd Peças" estiver vazia). Se houver correção riscada/escrita à caneta, \
+priorize o número escrito à caneta.
+6. SEM AGRUPAMENTO: NÃO agrupe nem some itens com códigos iguais; retorne cada linha do \
+documento como um objeto separado na lista, na ordem exata em que aparece.
+7. Não invente peças. Ignore cabeçalhos, totais, resumos da chapa e linhas em branco.
 """
+
+PROMPT_CLASSIFICAR_POPUP = (
+    "Analise esta caixa de aviso de um sistema ERP. Responda APENAS com uma destas "
+    "3 palavras exatas, sem pontuação nem explicação: NAO_CADASTRADO (se disser que "
+    "o produto/código não existe ou não está cadastrado), FALTA_MATERIAL (se disser "
+    "falta de material, saldo ou estoque insuficiente) ou OUTRO (para qualquer outro aviso)."
+)
 
 
 # =============================================================================
@@ -250,6 +264,142 @@ def focar_janela(hwnd: int) -> bool:
         return False
 
 
+def _ler_texto_hwnd(hwnd: int) -> str:
+    """Lê texto visível (título ou controle filho) de um HWND via GetWindowTextW."""
+    if not hwnd:
+        return ""
+    try:
+        user32 = ctypes.windll.user32
+        tamanho = user32.GetWindowTextLengthW(int(hwnd))
+        if tamanho <= 0:
+            return ""
+        buffer = ctypes.create_unicode_buffer(tamanho + 1)
+        user32.GetWindowTextW(int(hwnd), buffer, tamanho + 1)
+        return buffer.value.strip()
+    except Exception:
+        return ""
+
+
+def obter_texto_janela_completo(hwnd_popup: int) -> str:
+    """Coleta título e textos de todos os controles filhos do pop-up em minúsculas."""
+    if not hwnd_popup:
+        return ""
+    partes: list[str] = []
+    titulo = _ler_texto_hwnd(hwnd_popup)
+    if titulo:
+        partes.append(titulo)
+    try:
+        user32 = ctypes.windll.user32
+        enum_proc = ctypes.WINFUNCTYPE(
+            ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+        )
+
+        def _visitar_filho(child_hwnd, _lparam):
+            txt = _ler_texto_hwnd(int(child_hwnd))
+            if txt:
+                partes.append(txt)
+            return True
+
+        cb = enum_proc(_visitar_filho)
+        user32.EnumChildWindows(int(hwnd_popup), cb, 0)
+    except Exception:
+        pass
+    return " ".join(partes).lower()
+
+
+def classificar_texto_popup(texto: str) -> str | None:
+    """Classifica o texto extraído do pop-up pelas palavras-chave conhecidas."""
+    txt = (texto or "").lower()
+    if not txt:
+        return None
+    if any(
+        t in txt
+        for t in ("cadastr", "inexist", "não encontrad", "nao encontrad", "inválid", "invalid")
+    ):
+        return "NAO_CADASTRADO"
+    if any(t in txt for t in ("material", "estoque", "saldo", "insuficiente")):
+        return "FALTA_MATERIAL"
+    return None
+
+
+def _capturar_popup_em_ram(hwnd_popup: int) -> Image.Image:
+    """Captura o recorte do pop-up (com margem de 40px) apenas em memória RAM."""
+    try:
+        rect = ctypes.wintypes.RECT()
+        ok = bool(hwnd_popup) and bool(
+            ctypes.windll.user32.GetWindowRect(int(hwnd_popup), ctypes.byref(rect))
+        )
+        if ok:
+            largura = rect.right - rect.left
+            altura = rect.bottom - rect.top
+            if largura > 50 and altura > 50:
+                x1 = max(0, rect.left - 40) if rect.left >= 0 else rect.left - 40
+                y1 = max(0, rect.top - 40) if rect.top >= 0 else rect.top - 40
+                x2 = rect.right + 40
+                y2 = rect.bottom + 40
+                bbox = (x1, y1, x2, y2)
+                if x1 < 0 or y1 < 0:
+                    return ImageGrab.grab(bbox=bbox, all_screens=True)
+                return ImageGrab.grab(bbox=bbox)
+    except Exception:
+        pass
+    return ImageGrab.grab()
+
+
+def _classificar_popup_com_gemini(img: Image.Image) -> str:
+    """Classifica o print do pop-up em RAM via Gemini; retorna 'OUTRO' em falhas."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key or api_key == "sua_chave_aqui":
+        return "OUTRO"
+    try:
+        client = genai.Client(api_key=api_key)
+        conteudo = [
+            {
+                "type": "image",
+                "data": imagem_para_base64(img),
+                "mime_type": "image/jpeg",
+            },
+            {
+                "type": "text",
+                "text": PROMPT_CLASSIFICAR_POPUP,
+            },
+        ]
+        modelos = [MODELO_GEMINI] + [m for m in MODELOS_RESERVA if m != MODELO_GEMINI]
+        for n, modelo in enumerate(modelos):
+            try:
+                interaction = client.interactions.create(
+                    model=modelo,
+                    input=conteudo,
+                    generation_config={"thinking_level": "minimal"},
+                    timeout=12,
+                )
+                bruto = (interaction.output_text or "").strip().upper()
+                palavra = re.sub(r"[^A-Z_]", "", bruto)
+                if palavra in ("NAO_CADASTRADO", "FALTA_MATERIAL", "OUTRO"):
+                    return palavra
+                return "OUTRO"
+            except Exception as e:
+                if _erro_de_sobrecarga(e) and n < len(modelos) - 1:
+                    continue
+                return "OUTRO"
+    except Exception:
+        return "OUTRO"
+    return "OUTRO"
+
+
+def classificar_popup(hwnd_popup: int) -> str:
+    """Classifica pop-up em 2 camadas: texto ctypes instantâneo e print em RAM + Gemini."""
+    texto = obter_texto_janela_completo(hwnd_popup)
+    tipo = classificar_texto_popup(texto)
+    if tipo in ("NAO_CADASTRADO", "FALTA_MATERIAL"):
+        return tipo
+    try:
+        img = _capturar_popup_em_ram(hwnd_popup)
+        return _classificar_popup_com_gemini(img)
+    except Exception:
+        return "OUTRO"
+
+
 def _normalizar_ponto(valor) -> tuple[int, int] | None:
     """Converte [x, y], (x, y) ou objeto com .x/.y em tupla (int, int)."""
     if valor is None:
@@ -294,6 +444,15 @@ def carregar_config(caminho: str | None = None) -> dict:
         except (TypeError, ValueError):
             pass
 
+    if "fator_dobra" in dados:
+        try:
+            val_dobra = Decimal(str(dados["fator_dobra"]).strip().replace(",", "."))
+            if val_dobra.is_finite():
+                val_dobra = max(Decimal("0"), min(val_dobra, Decimal("100")))
+                cfg["fator_dobra"] = val_dobra
+        except (InvalidOperation, TypeError, ValueError):
+            pass
+
     if "enters_apos_qtd" in dados:
         try:
             cfg["enters_apos_qtd"] = max(1, min(int(dados["enters_apos_qtd"]), 50))
@@ -320,15 +479,23 @@ def carregar_config(caminho: str | None = None) -> dict:
 def salvar_config(pos_operacao, pos_produto, setas_operacao: int,
                   enters_apos_qtd: int, espera_apos_ok: float,
                   espera_apos_produto: float = ESPERA_APOS_PRODUTO,
+                  fator_dobra: Decimal | float | str = FATOR_DOBRA_PADRAO,
                   caminho: str | None = None) -> None:
     """Salva calibração de posições e parâmetros do robô em config.json."""
     caminho_alvo = caminho or CAMINHO_CONFIG
     op = _normalizar_ponto(pos_operacao)
     prod = _normalizar_ponto(pos_produto)
+    try:
+        dobra_dec = Decimal(str(fator_dobra).strip().replace(",", "."))
+        if not dobra_dec.is_finite():
+            dobra_dec = FATOR_DOBRA_PADRAO
+    except (InvalidOperation, TypeError, ValueError):
+        dobra_dec = FATOR_DOBRA_PADRAO
     dados = {
         "pos_operacao": [op[0], op[1]] if op is not None else None,
         "pos_produto": [prod[0], prod[1]] if prod is not None else None,
         "setas_operacao": int(setas_operacao),
+        "fator_dobra": float(round(dobra_dec, 4)),
         "espera_apos_produto": round(float(espera_apos_produto), 2),
         "enters_apos_qtd": int(enters_apos_qtd),
         "espera_apos_ok": round(float(espera_apos_ok), 2),
@@ -402,37 +569,113 @@ def limpar_e_digitar_destino(valor) -> None:
     digitar_campo_seguro(valor, limpar=True)
 
 
-def _formatar_valor_unitario(texto: str) -> str:
-    """Converte preços como 'R$ 199.906', '199.906', '199,906' ou '10.97' para '199,90' e '10,97'.
+def limpar_campo_produto_apos_popup() -> None:
+    """Apaga imediatamente o código inválido no campo Produto sem clicar fora."""
+    _enviar_tecla_win(VK_BACK)
+    time.sleep(0.08)
+    pyautogui.hotkey("ctrl", "a")
+    time.sleep(0.05)
+    _enviar_tecla_win(VK_BACK)
+    time.sleep(0.05)
+    _enviar_tecla_win(VK_END, estendida=True)
+    time.sleep(0.05)
+    _enviar_shift_home_win()
+    time.sleep(0.05)
+    _enviar_tecla_win(VK_BACK)
+    time.sleep(0.15)
 
-    Na folha de corte, o ponto funciona como vírgula decimal (com 2 ou 3 casas).
-    Mantém apenas 2 casas decimais (truncando a 3ª casa, sem arredondar para cima).
-    """
-    s = (texto or "").strip()
+
+def normalizar_dobra(valor) -> str:
+    """Retorna 'SIM' apenas se explícito; vazio, nulo ou qualquer outro texto vira 'NÃO'."""
+    return "SIM" if str(valor or "").strip().upper() == "SIM" else "NÃO"
+
+
+def _parse_decimal_seguro(valor, padrao: Decimal | None = Decimal("0")) -> Decimal | None:
+    """Converte strings de preço/peso ('R$ 16.754', '43,77', '1.234,56') em Decimal exato."""
+    if isinstance(valor, Decimal):
+        return valor if valor.is_finite() else padrao
+    if isinstance(valor, (int, float)):
+        try:
+            d = Decimal(str(valor))
+            return d if d.is_finite() else padrao
+        except InvalidOperation:
+            return padrao
+
+    s = (str(valor) if valor is not None else "").strip()
     if not s:
-        return VALOR_UNITARIO_PADRAO
-    s = s.replace("R$", "").replace("r$", "").strip()
+        return padrao
+    s = re.sub(r"(?i)r\$|kg", "", s).strip()
     if not s:
-        return VALOR_UNITARIO_PADRAO
-    # Se vier no formato "199.906,00" (IA interpretou ponto como milhar e adicionou ,00),
-    # desfaz para "199.906" quando houver apenas 1 ponto seguido de 3 dígitos e ",00":
+        return padrao
+
+    # Trata formato legado '199.906,00' (ponto de 3 casas decimais + ',00')
     if s.endswith(",00") and s.count(".") == 1 and s.count(",") == 1:
         parte_ant = s[:-3]
         partes_ponto = parte_ant.split(".")
-        if len(partes_ponto) == 2 and partes_ponto[0].isdigit() and len(partes_ponto[1]) == 3 and partes_ponto[1].isdigit():
+        if (
+            len(partes_ponto) == 2
+            and partes_ponto[0].isdigit()
+            and len(partes_ponto[1]) == 3
+            and partes_ponto[1].isdigit()
+        ):
             s = parte_ant
-    # Agora trata '.' como ',' (separador decimal único)
-    s_norm = s.replace(".", ",")
-    if s_norm.count(",") == 1:
-        inteiro, dec = s_norm.split(",")
-        inteiro_limpo = "".join(c for c in inteiro if c.isdigit())
-        dec_limpo = "".join(c for c in dec if c.isdigit())
-        if inteiro_limpo:
-            dec_2 = (dec_limpo + "00")[:2]
-            return f"{int(inteiro_limpo)},{dec_2}"
-    elif s_norm.isdigit():
-        return f"{int(s_norm)},00"
-    return s
+
+    s = s.replace(" ", "")
+    if "." in s and "," in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        if s.count(",") == 1:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif s.count(".") > 1:
+        partes = s.split(".")
+        if all(len(p) == 3 and p.isdigit() for p in partes[1:]):
+            s = "".join(partes)
+
+    try:
+        d = Decimal(s)
+        return d if d.is_finite() else padrao
+    except InvalidOperation:
+        return padrao
+
+
+def _formatar_peso(valor) -> str:
+    """Formata o peso em kg com vírgula e 2 casas decimais (ex.: '3,92')."""
+    d = _parse_decimal_seguro(valor, padrao=Decimal("0"))
+    if d is None:
+        return "0,00"
+    return f"{d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}".replace(".", ",")
+
+
+def calcular_valor_unitario(preco_base, peso, dobra,
+                            fator_dobra=FATOR_DOBRA_PADRAO) -> str:
+    """Calcula valor final = preco_base + (peso * fator_dobra) se Dobra == 'SIM'."""
+    p_base = _parse_decimal_seguro(preco_base, padrao=None)
+    if p_base is None:
+        return VALOR_UNITARIO_PADRAO
+    p_peso = _parse_decimal_seguro(peso, padrao=Decimal("0")) or Decimal("0")
+    fator = _parse_decimal_seguro(fator_dobra, padrao=FATOR_DOBRA_PADRAO)
+    if fator is None:
+        fator = FATOR_DOBRA_PADRAO
+
+    if normalizar_dobra(dobra) == "SIM":
+        valor_final = p_base + (p_peso * fator)
+    else:
+        valor_final = p_base
+
+    return f"{valor_final.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}".replace(".", ",")
+
+
+def _formatar_valor_unitario(texto: str) -> str:
+    """Formata um valor numérico editado manualmente para 2 casas decimais com vírgula."""
+    d = _parse_decimal_seguro(texto, padrao=None)
+    if d is None:
+        return VALOR_UNITARIO_PADRAO
+    return f"{d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}".replace(".", ",")
 
 
 def normalizar_codigo(codigo: str) -> str:
@@ -444,50 +687,215 @@ def normalizar_codigo(codigo: str) -> str:
 
 
 def _normalizar_item(item: ItemCorte) -> ItemCorte:
-    """Garante formatação correta de valor_unitario ('199,90') e padrão '23' para local_destino."""
+    """Garante formatação consistente de dobra, valor_unitario e local_destino."""
+    dobra_norm = normalizar_dobra(item.dobra)
     val = _formatar_valor_unitario(item.valor_unitario)
     dest = (item.local_destino or "").strip() or LOCAL_DESTINO_PADRAO
-    if val != item.valor_unitario or dest != item.local_destino:
-        return item.model_copy(update={"valor_unitario": val, "local_destino": dest})
-    return item
+    updates: dict = {}
+    if dobra_norm != item.dobra:
+        updates["dobra"] = dobra_norm
+    if val != item.valor_unitario:
+        updates["valor_unitario"] = val
+    if dest != item.local_destino:
+        updates["local_destino"] = dest
+    return item.model_copy(update=updates) if updates else item
 
 
-def consolidar_itens_extraidos(itens: list[ItemCorte]) -> list[ItemCorte]:
-    """Limpa prefixos de letras nos códigos extraídos e consolida duplicatas em ordem."""
-    grupos: dict[str, ItemCorte] = {}
-    for item in itens:
-        item_norm = _normalizar_item(item)
-        codigo_limpo = normalizar_codigo(item_norm.codigo)
-        item_limpo = (
-            item_norm
-            if codigo_limpo == item_norm.codigo
-            else item_norm.model_copy(update={"codigo": codigo_limpo})
-        )
-        existente = grupos.get(codigo_limpo)
-        if existente is None:
-            grupos[codigo_limpo] = item_limpo
+def _parse_int_seguro(valor, padrao: int | None = None) -> int | None:
+    m = re.search(r"\d+", str(valor or ""))
+    if not m:
+        return padrao
+    try:
+        return int(m.group())
+    except ValueError:
+        return padrao
+
+
+def _montar_item_corte(
+    codigo_bruto: str,
+    dobra_bruta,
+    preco_bruto,
+    peso_bruto,
+    quantidade: int,
+    fator_dobra=FATOR_DOBRA_PADRAO,
+    texto_linha_bruta: str = "",
+) -> ItemCorte | None:
+    """Constrói ItemCorte independente (sem agrupar) ou None se for item de TESTE."""
+    ref_raw = str(codigo_bruto or "").strip()
+    if not ref_raw:
+        return None
+    if "teste" in ref_raw.lower() or "teste" in str(texto_linha_bruta or "").lower():
+        return None
+
+    codigo_limpo = normalizar_codigo(ref_raw)
+    if not codigo_limpo:
+        return None
+
+    dobra_norm = normalizar_dobra(dobra_bruta)
+    p_base_dec = _parse_decimal_seguro(preco_bruto, padrao=None)
+    preco_base_str = (
+        VALOR_UNITARIO_PADRAO
+        if p_base_dec is None
+        else str(p_base_dec).replace(".", ",")
+    )
+    peso_dec = _parse_decimal_seguro(peso_bruto, padrao=Decimal("0")) or Decimal("0")
+    peso_str = _formatar_peso(peso_dec)
+    valor_final = calcular_valor_unitario(p_base_dec, peso_dec, dobra_norm, fator_dobra)
+
+    return ItemCorte(
+        codigo=codigo_limpo,
+        dobra=dobra_norm,
+        preco_base=preco_base_str,
+        peso=peso_str,
+        valor_unitario=valor_final,
+        valor_manual=False,
+        local_destino=LOCAL_DESTINO_PADRAO,
+        quantidade_final=max(0, int(quantidade)),
+        alterado_a_mao=False,
+        observacao="",
+    )
+
+
+def _normalizar_cabecalho(celula) -> str:
+    return re.sub(r"\s+", " ", str(celula or "").replace("\n", " ")).strip().lower()
+
+
+def _extrair_itens_tabelas_pagina(pagina, fator_dobra, stats: dict | None = None) -> list[ItemCorte]:
+    """Extrai linhas de corte via `extract_tables()` de uma página pdfplumber."""
+    itens: list[ItemCorte] = []
+    tabelas = pagina.extract_tables() or []
+    for tabela in tabelas:
+        mapa_cols: dict[str, int] | None = None
+        for linha in tabela:
+            if not linha:
+                continue
+            celulas = [str(c or "").strip() for c in linha]
+            if not any(celulas):
+                continue
+
+            normas = [_normalizar_cabecalho(c) for c in celulas]
+            idx_ref_hdr = next(
+                (i for i, h in enumerate(normas) if "referência" in h or "referencia" in h),
+                None,
+            )
+            if idx_ref_hdr is not None and any(
+                k in " ".join(normas) for k in ("dobra", "preço", "preco", "peso", "qtd")
+            ):
+                mapa_cols = {"ref": idx_ref_hdr}
+                for i, h in enumerate(normas):
+                    if "dobra" in h and "dobra" not in mapa_cols:
+                        mapa_cols["dobra"] = i
+                    elif ("preço" in h or "preco" in h) and "preco" not in mapa_cols:
+                        mapa_cols["preco"] = i
+                    elif ("qtd" in h or "peças" in h or "pecas" in h) and "qtd" not in mapa_cols:
+                        mapa_cols["qtd"] = i
+                    elif "pedido" in h and "pedido" not in mapa_cols:
+                        mapa_cols["pedido"] = i
+                    elif "peso" in h and "peso" not in mapa_cols:
+                        mapa_cols["peso"] = i
+                continue
+
+            if not mapa_cols:
+                continue
+
+            idx_ref = mapa_cols["ref"]
+            if idx_ref >= len(celulas):
+                continue
+            ref_bruta = celulas[idx_ref].strip()
+            if not ref_bruta:
+                continue
+            if _normalizar_cabecalho(ref_bruta) in ("referência", "referencia"):
+                continue
+
+            texto_linha = " ".join(c for c in celulas if c)
+            if "teste" in ref_bruta.lower() or "teste" in texto_linha.lower():
+                if stats is not None:
+                    stats["ignorados_teste"] = stats.get("ignorados_teste", 0) + 1
+                continue
+
+            dobra_bruta = (
+                celulas[mapa_cols["dobra"]]
+                if "dobra" in mapa_cols and mapa_cols["dobra"] < len(celulas)
+                else ""
+            )
+            preco_bruto = (
+                celulas[mapa_cols["preco"]]
+                if "preco" in mapa_cols and mapa_cols["preco"] < len(celulas)
+                else ""
+            )
+            peso_bruto = (
+                celulas[mapa_cols["peso"]]
+                if "peso" in mapa_cols and mapa_cols["peso"] < len(celulas)
+                else "0"
+            )
+            qtd_bruta = (
+                celulas[mapa_cols["qtd"]]
+                if "qtd" in mapa_cols and mapa_cols["qtd"] < len(celulas)
+                else ""
+            )
+            if not qtd_bruta.strip() and "pedido" in mapa_cols and mapa_cols["pedido"] < len(celulas):
+                qtd_bruta = celulas[mapa_cols["pedido"]]
+
+            qtd = _parse_int_seguro(qtd_bruta)
+            if qtd is None:
+                continue
+
+            item = _montar_item_corte(
+                ref_bruta,
+                dobra_bruta,
+                preco_bruto,
+                peso_bruto,
+                qtd,
+                fator_dobra=fator_dobra,
+                texto_linha_bruta=texto_linha,
+            )
+            if item is not None:
+                itens.append(item)
+
+    return itens
+
+
+def _extrair_texto_pdf_regex(texto_pagina: str, fator_dobra, stats: dict | None = None) -> list[ItemCorte]:
+    """Parser secundário por linhas de texto quando extract_tables() não detectar grade."""
+    itens: list[ItemCorte] = []
+    padrao = re.compile(
+        r"^\s*\d+\s+"                      # coluna #
+        r"(?P<ref>.+?)\s+"                 # Referência (pode conter texto/TESTE)
+        r"(?:(?P<dobra>SIM|N[ÃA]O)\s+)?"   # Dobra opcional
+        r"R\$\s*(?P<preco>[\d.,]+)\s+"     # Preço
+        r"[\d.,]+\s*x\s*[\d.,]+\s+"        # Dimensões
+        r"(?P<qtd>\d+)\s+"                 # Qtd Peças
+        r"(?:\d+\s+)?"                     # Pedido opcional
+        r"\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+"  # Tempo
+        r"(?P<peso>[\d.,]+)\s*$",          # Peso / KG
+        re.IGNORECASE,
+    )
+    for linha in (texto_pagina or "").splitlines():
+        if "r$" not in linha.lower():
             continue
-
-        obs_partes = [
-            p.strip()
-            for texto in (existente.observacao, item_limpo.observacao)
-            for p in (texto or "").split(" | ")
-            if p.strip()
-        ]
-        obs_unidas = " | ".join(dict.fromkeys(obs_partes))
-        valor_unit = existente.valor_unitario
-        if valor_unit == VALOR_UNITARIO_PADRAO and item_limpo.valor_unitario != VALOR_UNITARIO_PADRAO:
-            valor_unit = item_limpo.valor_unitario
-
-        grupos[codigo_limpo] = existente.model_copy(
-            update={
-                "quantidade_final": existente.quantidade_final + item_limpo.quantidade_final,
-                "alterado_a_mao": existente.alterado_a_mao or item_limpo.alterado_a_mao,
-                "observacao": obs_unidas,
-                "valor_unitario": valor_unit,
-            }
+        m = padrao.match(linha)
+        if not m:
+            continue
+        ref_bruta = m.group("ref").strip()
+        if "teste" in ref_bruta.lower() or "teste" in linha.lower():
+            if stats is not None:
+                stats["ignorados_teste"] = stats.get("ignorados_teste", 0) + 1
+            continue
+        qtd = _parse_int_seguro(m.group("qtd"))
+        if qtd is None:
+            continue
+        item = _montar_item_corte(
+            ref_bruta,
+            m.group("dobra") or "",
+            m.group("preco"),
+            m.group("peso"),
+            qtd,
+            fator_dobra=fator_dobra,
+            texto_linha_bruta=linha,
         )
-    return list(grupos.values())
+        if item is not None:
+            itens.append(item)
+    return itens
 
 
 def imagem_para_base64(img: Image.Image) -> str:
@@ -509,11 +917,8 @@ def _erro_de_sobrecarga(erro: Exception) -> bool:
                                     "timeout", "timed out"))
 
 
-def ler_folhas_com_gemini(imagens: list[Image.Image], aviso=None) -> list[ItemCorte]:
-    """Envia todas as imagens em UMA requisição e devolve a lista de itens.
-
-    `aviso` (opcional) recebe mensagens de status, ex.: troca para modelo reserva.
-    """
+def _extrair_bruto_com_gemini(conteudo: list[dict], aviso=None) -> list[ItemBrutoGemini]:
+    """Chama a API Gemini com temperature=0.0 e retorna itens brutos sem cálculo."""
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key or api_key == "sua_chave_aqui":
         raise RuntimeError(
@@ -522,23 +927,6 @@ def ler_folhas_com_gemini(imagens: list[Image.Image], aviso=None) -> list[ItemCo
         )
 
     client = genai.Client(api_key=api_key)
-
-    conteudo = []
-    for img in imagens:
-        conteudo.append({
-            "type": "image",
-            "data": imagem_para_base64(img),
-            "mime_type": "image/jpeg",
-        })
-    conteudo.append({
-        "type": "text",
-        "text": (
-            f"Leia as {len(imagens)} folha(s) de corte a laser enviadas e extraia "
-            "todas as peças com seus campos completos para Entrada da Produção, "
-            "consolidando códigos repetidos e priorizando anotações à caneta."
-        ),
-    })
-
     modelos = [MODELO_GEMINI] + [m for m in MODELOS_RESERVA if m != MODELO_GEMINI]
     ultimo_erro = None
     for n, modelo in enumerate(modelos):
@@ -549,11 +937,14 @@ def ler_folhas_com_gemini(imagens: list[Image.Image], aviso=None) -> list[ItemCo
                 model=modelo,
                 system_instruction=PROMPT_SISTEMA,
                 input=conteudo,
-                generation_config={"thinking_level": NIVEL_RACIOCINIO},
+                generation_config={
+                    "temperature": 0.0,
+                    "thinking_level": NIVEL_RACIOCINIO,
+                },
                 response_format={
                     "type": "text",
                     "mime_type": "application/json",
-                    "schema": ResultadoLeitura.model_json_schema(),
+                    "schema": ResultadoLeituraBruta.model_json_schema(),
                 },
                 timeout=TEMPO_LIMITE_IA,
             )
@@ -572,10 +963,104 @@ def ler_folhas_com_gemini(imagens: list[Image.Image], aviso=None) -> list[ItemCo
         texto = interaction.output_text
         if not texto:
             raise RuntimeError("A IA não retornou nenhum conteúdo. Tente novamente.")
-        itens = ResultadoLeitura.model_validate_json(texto).itens
-        return consolidar_itens_extraidos(itens)
+        return ResultadoLeituraBruta.model_validate_json(texto).itens
 
     raise RuntimeError(f"Todos os modelos estão indisponíveis agora: {ultimo_erro}")
+
+
+def _converter_brutos_em_itens(
+    brutos: list[ItemBrutoGemini],
+    fator_dobra=FATOR_DOBRA_PADRAO,
+    stats: dict | None = None,
+) -> list[ItemCorte]:
+    """Filtra 'teste', limpa prefixos/dobra e calcula valor_unitario sem agrupar."""
+    resultado: list[ItemCorte] = []
+    for bruto in brutos:
+        if "teste" in str(bruto.codigo or "").lower():
+            if stats is not None:
+                stats["ignorados_teste"] = stats.get("ignorados_teste", 0) + 1
+            continue
+        item = _montar_item_corte(
+            bruto.codigo,
+            bruto.dobra,
+            bruto.preco_base,
+            bruto.peso,
+            bruto.quantidade,
+            fator_dobra=fator_dobra,
+        )
+        if item is not None:
+            resultado.append(item)
+    return resultado
+
+
+def extrair_itens_pdf(
+    caminho_pdf: str,
+    fator_dobra=FATOR_DOBRA_PADRAO,
+    aviso=None,
+    stats: dict | None = None,
+) -> list[ItemCorte]:
+    """Extrai peças de PDF via `pdfplumber` (prioritário) com fallback automático para Gemini."""
+    itens: list[ItemCorte] = []
+    with pdfplumber.open(caminho_pdf) as pdf:
+        for pagina in pdf.pages:
+            extraidos = _extrair_itens_tabelas_pagina(pagina, fator_dobra, stats=stats)
+            if not extraidos:
+                extraidos = _extrair_texto_pdf_regex(
+                    pagina.extract_text() or "", fator_dobra, stats=stats
+                )
+            itens.extend(extraidos)
+
+    if itens:
+        return itens
+
+    # Fallback automático para PDF escaneado / sem tabela extraível via pdfplumber
+    if aviso:
+        aviso("⏳ PDF sem tabela selecionável. Lendo com Gemini...")
+    with open(caminho_pdf, "rb") as arq:
+        pdf_b64 = base64.b64encode(arq.read()).decode("utf-8")
+
+    conteudo = [
+        {
+            "type": "document",
+            "data": pdf_b64,
+            "mime_type": "application/pdf",
+        },
+        {
+            "type": "text",
+            "text": (
+                "Extraia todas as linhas válidas de peças deste PDF em JSON bruto, "
+                "sem calcular dobra, sem incluir itens com 'TESTE' e sem agrupar códigos repetidos."
+            ),
+        },
+    ]
+    brutos = _extrair_bruto_com_gemini(conteudo, aviso=aviso)
+    return _converter_brutos_em_itens(brutos, fator_dobra=fator_dobra, stats=stats)
+
+
+def ler_folhas_com_gemini(
+    imagens: list[Image.Image],
+    fator_dobra=FATOR_DOBRA_PADRAO,
+    aviso=None,
+    stats: dict | None = None,
+) -> list[ItemCorte]:
+    """Envia imagens para a IA e retorna cada linha extraída sem agrupar duplicatas."""
+    conteudo = []
+    for img in imagens:
+        conteudo.append({
+            "type": "image",
+            "data": imagem_para_base64(img),
+            "mime_type": "image/jpeg",
+        })
+    conteudo.append({
+        "type": "text",
+        "text": (
+            f"Leia as {len(imagens)} folha(s) de corte a laser enviadas e extraia cada "
+            "linha válida em JSON bruto, ignorando itens com 'TESTE' e sem agrupar nem "
+            "somar códigos repetidos."
+        ),
+    })
+    brutos = _extrair_bruto_com_gemini(conteudo, aviso=aviso)
+    return _converter_brutos_em_itens(brutos, fator_dobra=fator_dobra, stats=stats)
 
 
 # =============================================================================
@@ -585,9 +1070,11 @@ class App:
     # Mapeamento das colunas editáveis direto na célula
     COLUNAS_EDITAVEIS = {
         "#1": "codigo",
-        "#2": "valor_unitario",
-        "#3": "local_destino",
-        "#4": "quantidade_final",
+        "#2": "dobra",
+        "#3": "peso",
+        "#4": "valor_unitario",
+        "#5": "local_destino",
+        "#6": "quantidade_final",
     }
 
     def __init__(self, root: tk.Tk):
@@ -604,7 +1091,8 @@ class App:
         self.parar_solicitado = False
         self._esc_anterior = False
         self._f12_anterior = False
-        self.idx_pausado_popup: int | None = None
+        self.uid_pausado_popup: str | None = None
+        self._ignorados_teste_lote = 0
 
         cfg = carregar_config()
         self.pos_operacao: tuple[int, int] | None = cfg.get("pos_operacao")
@@ -613,16 +1101,19 @@ class App:
 
         # Variáveis do Painel de Calibração
         setas_ini = cfg.get("setas_operacao", SETAS_OPERACAO_PADRAO)
+        fator_dobra_ini = cfg.get("fator_dobra", FATOR_DOBRA_PADRAO)
         espera_prod_ini = cfg.get("espera_apos_produto", ESPERA_APOS_PRODUTO)
         enters_ini = cfg.get("enters_apos_qtd", ENTERS_APOS_QTD_PADRAO)
         espera_ini = cfg.get("espera_apos_ok", ESPERA_APOS_OK)
         self.var_setas_operacao = tk.StringVar(value=str(setas_ini))
+        self.var_fator_dobra = tk.StringVar(value=str(fator_dobra_ini).replace(".", ","))
         self.var_espera_apos_produto = tk.StringVar(value=f"{float(espera_prod_ini):.1f}")
         self.var_enters_apos_qtd = tk.StringVar(value=str(enters_ini))
         self.var_espera_apos_ok = tk.StringVar(value=f"{float(espera_ini):.1f}")
 
         self._montar_interface()
         self._atualizar_indicador_calibracao()
+        self.var_fator_dobra.trace_add("write", lambda *_a: self._ao_mudar_fator_dobra())
 
         # Ctrl+V na janela principal (não afeta caixas de edição)
         self.root.bind("<Control-v>", self._atalho_colar)
@@ -649,8 +1140,8 @@ class App:
         topo = ttk.Frame(self.root, padding=(10, 10, 10, 4))
         topo.pack(fill="x")
 
-        self.btn_abrir = ttk.Button(topo, text="📂 Abrir Foto(s) da Folha",
-                                    command=self.abrir_fotos)
+        self.btn_abrir = ttk.Button(topo, text="📂 Abrir PDF / Foto(s)",
+                                    command=self.abrir_arquivos)
         self.btn_colar = ttk.Button(topo, text="📋 Colar Imagem (Ctrl+V)",
                                     command=self.colar_imagem)
         self.btn_limpar = ttk.Button(topo, text="🗑️ Limpar Lista",
@@ -670,9 +1161,8 @@ class App:
         # --- dica de edição e atalhos
         ttk.Label(
             self.root,
-            text=("Duplo clique na linha: editar campos (Código, Valor Unit., Destino, Qtd Final)  •  "
-                  "Atalhos globais na digitação: F12 = Pausar/Retomar  |  Esc = Parar  |  "
-                  "Mouse no canto sup. esq. = Abortar"),
+            text=("Duplo clique na linha: editar campos (Código, Dobra, Peso, Preço, Destino, Qtd)  •  "
+                  "F12 = Pausar/Retomar  |  Esc = Parar  |  Mouse no canto sup. esq. = Abortar"),
             foreground="#005fb8", padding=(10, 2, 10, 0),
         ).pack(fill="x")
 
@@ -680,28 +1170,29 @@ class App:
         meio = ttk.Frame(self.root, padding=(10, 6, 10, 6))
         meio.pack(fill="both", expand=True)
 
-        colunas = ("codigo", "valor_unit", "destino", "qtd", "manual", "obs", "status")
+        colunas = ("codigo", "dobra", "peso", "valor_unit", "destino", "qtd", "status")
         self.tree = ttk.Treeview(meio, columns=colunas, show="headings",
                                  selectmode="extended")
-        self.tree.heading("codigo", text="Código (Produto)")
-        self.tree.heading("valor_unit", text="Valor Unit.")
+        self.tree.heading("codigo", text="Código")
+        self.tree.heading("dobra", text="Dobra")
+        self.tree.heading("peso", text="Peso (kg)")
+        self.tree.heading("valor_unit", text="Valor Unitário")
         self.tree.heading("destino", text="Destino")
-        self.tree.heading("qtd", text="Qtd Final")
-        self.tree.heading("manual", text="Anotação Manual?")
-        self.tree.heading("obs", text="Observação")
+        self.tree.heading("qtd", text="Quantidade")
         self.tree.heading("status", text="Status")
 
-        self.tree.column("codigo", width=200, anchor="w")
-        self.tree.column("valor_unit", width=95, anchor="center")
-        self.tree.column("destino", width=75, anchor="center")
-        self.tree.column("qtd", width=85, anchor="center")
-        self.tree.column("manual", width=130, anchor="center")
-        self.tree.column("obs", width=355, anchor="w")
-        self.tree.column("status", width=190, anchor="center")
+        self.tree.column("codigo", width=230, anchor="w")
+        self.tree.column("dobra", width=85, anchor="center")
+        self.tree.column("peso", width=105, anchor="center")
+        self.tree.column("valor_unit", width=125, anchor="center")
+        self.tree.column("destino", width=85, anchor="center")
+        self.tree.column("qtd", width=105, anchor="center")
+        self.tree.column("status", width=220, anchor="center")
 
-        self.tree.tag_configure("alterado", background=COR_ALTERADO)
+        self.tree.tag_configure("dobra_sim", background=COR_DOBRA_SIM)
         self.tree.tag_configure("lancado", background=COR_LANCADO)
         self.tree.tag_configure("popup", background=COR_POPUP)
+        self.tree.tag_configure("nao_cadastrado", background=COR_NAO_CADASTRADO)
 
         scroll = ttk.Scrollbar(meio, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -725,15 +1216,19 @@ class App:
         self.menu.add_command(label="🔄 Desmarcar todos os lançados",
                               command=self.desmarcar_todos_digitados)
         self.menu.add_separator()
-        self.menu.add_command(label="📝 Editar item completo (Código, Valor, Destino, Qtd)...",
+        self.menu.add_command(label="📝 Editar item completo...",
                               command=self._editar_selecionada_dialogo)
-        self.menu.add_command(label="✏️ Editar Quantidade Final",
+        self.menu.add_command(label="✏️ Editar Quantidade",
                               command=self.editar_qtd_selecionada)
-        self.menu.add_command(label="💲 Editar Valor Unitário",
-                              command=lambda: self._editar_selecionada("#2"))
-        self.menu.add_command(label="📦 Editar Local de Destino",
+        self.menu.add_command(label="🔄 Alternar Dobra (SIM / NÃO)",
+                              command=self._alternar_dobra_selecionada)
+        self.menu.add_command(label="⚖️ Editar Peso (kg)",
                               command=lambda: self._editar_selecionada("#3"))
-        self.menu.add_command(label="🔤 Editar Código (Produto)",
+        self.menu.add_command(label="💲 Editar Valor Unitário",
+                              command=lambda: self._editar_selecionada("#4"))
+        self.menu.add_command(label="📦 Editar Destino",
+                              command=lambda: self._editar_selecionada("#5"))
+        self.menu.add_command(label="🔤 Editar Código",
                               command=lambda: self._editar_selecionada("#1"))
         self.menu.add_separator()
         self.menu.add_command(label="➕ Somar 1 na Qtd", command=lambda: self._ajustar_qtd(+1))
@@ -752,27 +1247,33 @@ class App:
         linha_cal = ttk.Frame(barra_robo)
         linha_cal.pack(fill="x", pady=(0, 6))
 
-        ttk.Label(linha_cal, text="Setas p/ baixo (Operação):").pack(side="left")
+        ttk.Label(linha_cal, text="Setas Operação:").pack(side="left")
         self.spn_setas_operacao = ttk.Spinbox(
-            linha_cal, from_=0, to=20, increment=1, width=5,
+            linha_cal, from_=0, to=20, increment=1, width=4,
             textvariable=self.var_setas_operacao, font=("Segoe UI", 10))
         self.spn_setas_operacao.pack(side="left", padx=(4, 10))
 
-        ttk.Label(linha_cal, text="Espera após Produto (s):").pack(side="left")
+        ttk.Label(linha_cal, text="Fator Dobra:").pack(side="left")
+        self.spn_fator_dobra = ttk.Spinbox(
+            linha_cal, from_=0.0, to=100.0, increment=0.1, width=6,
+            textvariable=self.var_fator_dobra, font=("Segoe UI", 10))
+        self.spn_fator_dobra.pack(side="left", padx=(4, 10))
+
+        ttk.Label(linha_cal, text="Espera Produto (s):").pack(side="left")
         self.spn_espera_apos_produto = ttk.Spinbox(
-            linha_cal, from_=0.2, to=15.0, increment=0.1, width=6,
+            linha_cal, from_=0.2, to=15.0, increment=0.1, width=5,
             textvariable=self.var_espera_apos_produto, font=("Segoe UI", 10))
         self.spn_espera_apos_produto.pack(side="left", padx=(4, 10))
 
-        ttk.Label(linha_cal, text="Enters após Quantidade (até OK):").pack(side="left")
+        ttk.Label(linha_cal, text="Enters até OK:").pack(side="left")
         self.spn_enters_apos_qtd = ttk.Spinbox(
-            linha_cal, from_=1, to=50, increment=1, width=5,
+            linha_cal, from_=1, to=50, increment=1, width=4,
             textvariable=self.var_enters_apos_qtd, font=("Segoe UI", 10))
         self.spn_enters_apos_qtd.pack(side="left", padx=(4, 10))
 
-        ttk.Label(linha_cal, text="Espera após OK (s):").pack(side="left")
+        ttk.Label(linha_cal, text="Espera OK (s):").pack(side="left")
         self.spn_espera_apos_ok = ttk.Spinbox(
-            linha_cal, from_=0.2, to=15.0, increment=0.1, width=6,
+            linha_cal, from_=0.2, to=15.0, increment=0.1, width=5,
             textvariable=self.var_espera_apos_ok, font=("Segoe UI", 10))
         self.spn_espera_apos_ok.pack(side="left", padx=(4, 4))
 
@@ -858,6 +1359,7 @@ class App:
             self._ler_enters_apos_qtd(),
             self._ler_espera_apos_ok(),
             espera_apos_produto=self._ler_espera_apos_produto(),
+            fator_dobra=self._ler_fator_dobra(),
         )
 
     def _garantir_calibrado(self) -> bool:
@@ -895,8 +1397,18 @@ class App:
         self.btn_continuar_proxima.configure(state=estado)
         self.btn_repetir_pausada.configure(state=estado)
 
+    def _idx_por_uid(self, uid: str | int | None) -> int | None:
+        if uid is None:
+            return None
+        if isinstance(uid, int):
+            return uid if 0 <= uid < len(self.itens) else None
+        for i, it in enumerate(self.itens):
+            if it.uid == uid:
+                return i
+        return None
+
     def _limpar_estado_popup(self):
-        self.idx_pausado_popup = None
+        self.uid_pausado_popup = None
         self._definir_botoes_retomada(False)
 
     def _set_ocupado(self, ocupado: bool, modo: str = ""):
@@ -921,8 +1433,7 @@ class App:
 
         pode_retomar_popup = (
             not ocupado
-            and self.idx_pausado_popup is not None
-            and 0 <= self.idx_pausado_popup < len(self.itens)
+            and self._idx_por_uid(self.uid_pausado_popup) is not None
         )
         self._definir_botoes_retomada(pode_retomar_popup)
 
@@ -933,6 +1444,42 @@ class App:
         except ValueError:
             self.var_setas_operacao.set(str(SETAS_OPERACAO_PADRAO))
             return SETAS_OPERACAO_PADRAO
+
+    def _ler_fator_dobra(self, corrigir_campo: bool = True) -> Decimal:
+        d = _parse_decimal_seguro(self.var_fator_dobra.get(), padrao=None)
+        if d is None or d < Decimal("0") or d > Decimal("100"):
+            if corrigir_campo:
+                self.var_fator_dobra.set(str(FATOR_DOBRA_PADRAO).replace(".", ","))
+            return FATOR_DOBRA_PADRAO
+        return d
+
+    def _ao_mudar_fator_dobra(self):
+        if not hasattr(self, "tree"):
+            return
+        d = _parse_decimal_seguro(self.var_fator_dobra.get(), padrao=None)
+        if d is not None and Decimal("0") <= d <= Decimal("100"):
+            self.recalcular_valores_tabela(d)
+
+    def recalcular_valores_tabela(self, fator_dobra: Decimal | None = None):
+        """Recalcula imediatamente Valor Unitário de itens não editados manualmente."""
+        fator = fator_dobra if fator_dobra is not None else self._ler_fator_dobra()
+        filhos = set(self.tree.get_children())
+        alterou = False
+        for i, item in enumerate(self.itens):
+            if item.valor_manual:
+                continue
+            novo_val = calcular_valor_unitario(item.preco_base, item.peso, item.dobra, fator)
+            if novo_val != item.valor_unitario:
+                item = item.model_copy(update={"valor_unitario": novo_val})
+                self.itens[i] = item
+                alterou = True
+                if item.uid in filhos:
+                    self.tree.item(
+                        item.uid, tags=self._tags_item(item),
+                        values=self._valores_linha(item),
+                    )
+        if alterou:
+            self._atualizar_resumo()
 
     def _ler_enters_apos_qtd(self) -> int:
         try:
@@ -960,7 +1507,11 @@ class App:
 
     def _status_item_texto(self, item: ItemCorte) -> str:
         if item.erro_popup:
-            return "⚠️ Falta de material / Pop-up"
+            if item.tipo_popup == "FALTA_MATERIAL":
+                return "⚠️ Falta de material"
+            return "⚠️ Pop-up detectado"
+        if item.nao_cadastrado:
+            return "⏭️ Não cadastrado"
         if item.lancado:
             return "✅ Resolvida manual" if item.resolvida_manual else "✅ Lançado"
         if item.quantidade_final <= 0:
@@ -970,43 +1521,54 @@ class App:
     def _tags_item(self, item: ItemCorte) -> tuple[str, ...]:
         if item.erro_popup:
             return ("popup",)
+        if item.nao_cadastrado:
+            return ("nao_cadastrado",)
         if item.lancado:
             return ("lancado",)
-        if item.alterado_a_mao:
-            return ("alterado",)
+        if normalizar_dobra(item.dobra) == "SIM":
+            return ("dobra_sim",)
         return ()
 
     def _valores_linha(self, item: ItemCorte) -> tuple:
         return (
             item.codigo,
+            normalizar_dobra(item.dobra),
+            item.peso,
             item.valor_unitario,
             item.local_destino,
             item.quantidade_final,
-            "✏️ Sim" if item.alterado_a_mao else "Não",
-            item.observacao,
             self._status_item_texto(item),
         )
 
     def atualizar_tabela(self):
         self._fechar_editor(salvar=False)
         self.tree.delete(*self.tree.get_children())
-        for i, item in enumerate(self.itens):
-            self.tree.insert("", "end", iid=str(i), tags=self._tags_item(item),
+        for item in self.itens:
+            self.tree.insert("", "end", iid=item.uid, tags=self._tags_item(item),
                              values=self._valores_linha(item))
         self._atualizar_resumo()
 
     def _atualizar_resumo(self):
-        n_alt = sum(1 for it in self.itens if it.alterado_a_mao)
-        n_lanc = sum(1 for it in self.itens if it.lancado)
+        n_dobra = sum(1 for it in self.itens if normalizar_dobra(it.dobra) == "SIM")
+        n_lanc = sum(1 for it in self.itens if it.lancado and not it.nao_cadastrado)
+        n_pulados = sum(1 for it in self.itens if it.nao_cadastrado)
         soma_pecas = sum(max(0, it.quantidade_final) for it in self.itens)
-        self.var_total.set(
-            f"{len(self.itens)} itens ({soma_pecas} peças)  •  "
-            f"{n_alt} manual  •  {n_lanc} lançados (✅)"
+        resumo = (
+            f"{len(self.itens)} linhas ({soma_pecas} peças)  •  "
+            f"{n_dobra} c/ dobra  •  {n_lanc} lançados (✅)"
         )
+        if n_pulados:
+            resumo += f"  •  {n_pulados} não cadastrados (⏭️)"
+        if self._ignorados_teste_lote:
+            resumo += f"  •  {self._ignorados_teste_lote} TESTE ignorado(s)"
+        self.var_total.set(resumo)
 
-    def _atualizar_linha_tabela(self, idx: int):
+    def _atualizar_linha_tabela(self, alvo):
+        idx = self._idx_por_uid(alvo)
+        if idx is None:
+            return
         item = self.itens[idx]
-        iid = str(idx)
+        iid = item.uid
         if iid in self.tree.get_children():
             self.tree.item(iid, tags=self._tags_item(item),
                            values=self._valores_linha(item))
@@ -1015,20 +1577,38 @@ class App:
             self.tree.see(iid)
         self._atualizar_resumo()
 
-    def _marcar_lancado(self, idx: int, valor: bool = True, resolvida_manual: bool = False):
-        if 0 <= idx < len(self.itens):
+    def _marcar_lancado(self, alvo, valor: bool = True, resolvida_manual: bool = False):
+        idx = self._idx_por_uid(alvo)
+        if idx is not None:
             self.itens[idx] = self.itens[idx].model_copy(update={
                 "lancado": valor,
                 "erro_popup": False,
+                "nao_cadastrado": False,
+                "tipo_popup": "",
                 "resolvida_manual": resolvida_manual if valor else False,
             })
             self._atualizar_linha_tabela(idx)
 
-    def _marcar_popup_item(self, idx: int):
-        if 0 <= idx < len(self.itens):
+    def _marcar_nao_cadastrado(self, alvo):
+        idx = self._idx_por_uid(alvo)
+        if idx is not None:
+            self.itens[idx] = self.itens[idx].model_copy(update={
+                "lancado": True,
+                "nao_cadastrado": True,
+                "erro_popup": False,
+                "tipo_popup": "",
+                "resolvida_manual": False,
+            })
+            self._atualizar_linha_tabela(idx)
+
+    def _marcar_popup_item(self, alvo, tipo_popup: str = "OUTRO"):
+        idx = self._idx_por_uid(alvo)
+        if idx is not None:
             self.itens[idx] = self.itens[idx].model_copy(update={
                 "lancado": False,
                 "erro_popup": True,
+                "nao_cadastrado": False,
+                "tipo_popup": tipo_popup,
                 "resolvida_manual": False,
             })
             self._atualizar_linha_tabela(idx)
@@ -1036,35 +1616,40 @@ class App:
     def alternar_digitado_selecionados(self):
         if self.ocupado:
             return
-        sel = [int(i) for i in self.tree.selection()]
-        if not sel:
+        uids = list(self.tree.selection())
+        if not uids:
             iid = self._selecionada()
             if iid is not None:
-                sel = [int(iid)]
-        if not sel:
+                uids = [iid]
+        indices = [i for u in uids if (i := self._idx_por_uid(u)) is not None]
+        if not indices:
             return
-        novo_estado = not all(self.itens[idx].lancado for idx in sel)
-        for idx in sel:
+        novo_estado = not all(self.itens[idx].lancado for idx in indices)
+        for idx in indices:
             self.itens[idx] = self.itens[idx].model_copy(update={
                 "lancado": novo_estado,
                 "erro_popup": False,
+                "nao_cadastrado": False,
+                "tipo_popup": "",
                 "resolvida_manual": False,
             })
         self.atualizar_tabela()
-        for idx in sel:
-            self.tree.selection_add(str(idx))
+        for idx in indices:
+            self.tree.selection_add(self.itens[idx].uid)
 
     def desmarcar_todos_digitados(self):
         if self.ocupado or not self.itens:
             return
         self._limpar_estado_popup()
-        if not any(it.lancado or it.erro_popup for it in self.itens):
+        if not any(it.lancado or it.erro_popup or it.nao_cadastrado for it in self.itens):
             self._set_status("Nenhum item está marcado como lançado.")
             return
         self.itens = [
             it.model_copy(update={
                 "lancado": False,
                 "erro_popup": False,
+                "nao_cadastrado": False,
+                "tipo_popup": "",
                 "resolvida_manual": False,
             })
             for it in self.itens
@@ -1073,24 +1658,23 @@ class App:
         self._set_status("🔄 Marcações de lançado (✅) limpas.")
 
     # --------------------------------------------------------------- leitura
-    def abrir_fotos(self):
+    def abrir_arquivos(self):
         if self.ocupado:
             return
         caminhos = filedialog.askopenfilenames(
-            title="Selecione uma ou mais fotos das folhas de corte",
-            filetypes=[("Imagens", "*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff"),
-                       ("Todos os arquivos", "*.*")],
+            title="Selecione um ou mais PDFs ou fotos das folhas de corte",
+            filetypes=[
+                ("PDF e Imagens", "*.pdf *.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
+                ("Arquivos PDF", "*.pdf"),
+                ("Imagens", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
+                ("Todos os arquivos", "*.*"),
+            ],
         )
         if not caminhos:
             return
-        try:
-            imagens = [Image.open(c) for c in caminhos]
-            for img in imagens:
-                img.load()
-        except Exception as e:
-            messagebox.showerror("Erro ao abrir imagem", str(e))
-            return
-        self._processar(imagens, acumular=False)
+        self._processar_caminhos(list(caminhos), acumular=False)
+
+    abrir_fotos = abrir_arquivos
 
     def _atalho_colar(self, event=None):
         # Ctrl+V dentro de uma caixa de texto cola texto normalmente
@@ -1110,52 +1694,95 @@ class App:
             messagebox.showerror("Erro ao ler a área de transferência", str(e))
             return
 
-        imagens: list[Image.Image] = []
         if isinstance(conteudo, Image.Image):
-            imagens = [conteudo]
-        elif isinstance(conteudo, list):  # arquivos copiados no Explorer
-            for caminho in conteudo:
-                try:
-                    img = Image.open(caminho)
-                    img.load()
-                    imagens.append(img)
-                except Exception:
-                    pass
-
-        if not imagens:
-            messagebox.showwarning(
-                "Nada para colar",
-                "Não há imagem na área de transferência.\n\n"
-                "No WhatsApp Web: clique com o botão direito na foto → "
-                "'Copiar imagem' e depois use Ctrl+V aqui.",
-            )
+            self._processar_entradas([("imagem", conteudo)], acumular=True)
             return
-        self._processar(imagens, acumular=True)
+        if isinstance(conteudo, list) and conteudo:
+            caminhos = [c for c in conteudo if isinstance(c, str) and os.path.isfile(c)]
+            if caminhos:
+                self._processar_caminhos(caminhos, acumular=True)
+                return
 
-    def _processar(self, imagens: list[Image.Image], acumular: bool):
+        messagebox.showwarning(
+            "Nada para colar",
+            "Não há imagem nem arquivo PDF na área de transferência.\n\n"
+            "No WhatsApp Web: clique com o botão direito na foto → 'Copiar imagem' "
+            "ou copie um PDF no Explorer e use Ctrl+V aqui.",
+        )
+
+    def _processar_caminhos(self, caminhos: list[str], acumular: bool):
+        entradas: list[tuple[str, object]] = []
+        try:
+            for c in caminhos:
+                if str(c).lower().endswith(".pdf"):
+                    entradas.append(("pdf", c))
+                else:
+                    img = Image.open(c)
+                    img.load()
+                    entradas.append(("imagem", img))
+        except Exception as e:
+            messagebox.showerror("Erro ao abrir arquivo", str(e))
+            return
+        if not entradas:
+            return
+        self._processar_entradas(entradas, acumular=acumular)
+
+    def _processar_entradas(self, entradas: list[tuple[str, object]], acumular: bool):
+        fator_dobra = self._ler_fator_dobra()
         self._set_ocupado(True, modo="ia")
-        self._set_status(f"⏳ Lendo {len(imagens)} imagem(ns) com a IA... aguarde.")
+        self._set_status(f"⏳ Lendo {len(entradas)} arquivo(s)... aguarde.")
 
         def tarefa():
             try:
-                novos = ler_folhas_com_gemini(
-                    imagens, aviso=lambda m: self.root.after(0, self._set_status, m))
-                self.root.after(0, self._leitura_ok, novos, acumular)
+                stats = {"ignorados_teste": 0}
+                novos: list[ItemCorte] = []
+                lote_imgs: list[Image.Image] = []
+                aviso_fn = lambda m: self.root.after(0, self._set_status, m)
+
+                def _flush_imagens():
+                    if lote_imgs:
+                        novos.extend(
+                            ler_folhas_com_gemini(
+                                lote_imgs, fator_dobra=fator_dobra,
+                                aviso=aviso_fn, stats=stats,
+                            )
+                        )
+                        lote_imgs.clear()
+
+                for tipo, dado in entradas:
+                    if tipo == "pdf":
+                        _flush_imagens()
+                        novos.extend(
+                            extrair_itens_pdf(
+                                str(dado), fator_dobra=fator_dobra,
+                                aviso=aviso_fn, stats=stats,
+                            )
+                        )
+                    else:
+                        lote_imgs.append(dado)  # type: ignore[arg-type]
+                _flush_imagens()
+
+                self.root.after(
+                    0, self._leitura_ok, novos, acumular, stats["ignorados_teste"]
+                )
             except Exception as e:
                 self.root.after(0, self._leitura_erro, e)
 
         threading.Thread(target=tarefa, daemon=True).start()
 
-    def _leitura_ok(self, novos: list[ItemCorte], acumular: bool):
+    def _leitura_ok(self, novos: list[ItemCorte], acumular: bool, ignorados_teste: int = 0):
         if acumular:
             self.itens.extend(novos)
+            self._ignorados_teste_lote += ignorados_teste
         else:
             self._limpar_estado_popup()
             self.itens = list(novos)
+            self._ignorados_teste_lote = ignorados_teste
         self.atualizar_tabela()
         self._set_ocupado(False)
         modo = "adicionados ao final" if acumular else "carregados"
-        self._set_status(f"✅ {len(novos)} itens {modo}. Confira as linhas amarelas!")
+        extra = f" ({ignorados_teste} TESTE ignorado(s))" if ignorados_teste else ""
+        self._set_status(f"✅ {len(novos)} itens {modo}{extra}.")
 
     def _leitura_erro(self, erro: Exception):
         self._set_ocupado(False)
@@ -1165,7 +1792,7 @@ class App:
             msg = ("Sem conexão com a internet (ou ela caiu durante a leitura).\n\n"
                    "Verifique a internet e tente de novo.\n\n"
                    f"Detalhe técnico: {erro}")
-        messagebox.showerror("Erro na leitura da IA", msg)
+        messagebox.showerror("Erro na leitura", msg)
 
     # ---------------------------------------------------------------- edição
     def limpar_lista(self):
@@ -1173,6 +1800,7 @@ class App:
             return
         if messagebox.askyesno("Limpar Lista", "Apagar todos os itens da lista?"):
             self.itens.clear()
+            self._ignorados_teste_lote = 0
             self._limpar_estado_popup()
             self.atualizar_tabela()
             self._set_status("Lista limpa. Pronto para um novo lote.")
@@ -1180,23 +1808,20 @@ class App:
     def remover_selecionados(self, _event=None):
         if self.ocupado:
             return
-        selecionados = sorted((int(i) for i in self.tree.selection()), reverse=True)
-        if not selecionados:
+        uids_sel = set(self.tree.selection())
+        if not uids_sel:
             return
-        if self.idx_pausado_popup is not None:
-            if self.idx_pausado_popup in selecionados:
-                self._limpar_estado_popup()
-            else:
-                self.idx_pausado_popup -= sum(1 for i in selecionados if i < self.idx_pausado_popup)
-        for idx in selecionados:
-            del self.itens[idx]
+        if self.uid_pausado_popup in uids_sel:
+            self._limpar_estado_popup()
+        removidos = sum(1 for it in self.itens if it.uid in uids_sel)
+        self.itens = [it for it in self.itens if it.uid not in uids_sel]
         self.atualizar_tabela()
         self._set_ocupado(False)
-        self._set_status(f"{len(selecionados)} linha(s) removida(s).")
+        self._set_status(f"{removidos} linha(s) removida(s).")
 
     # ------------------------------------------------- edição direta e diálogo
     def _selecionada(self):
-        """iid da linha em foco/selecionada (ou None)."""
+        """uid da linha em foco/selecionada (ou None)."""
         foco = self.tree.focus()
         if foco and foco in self.tree.selection():
             return foco
@@ -1212,16 +1837,18 @@ class App:
         coluna = self.tree.identify_column(event.x)
         if not iid:
             return
+        idx = self._idx_por_uid(iid)
+        if idx is None:
+            return
         if coluna == "#7":                  # Status: alterna ✅ Lançado
-            idx = int(iid)
-            self._marcar_lancado(idx, not self.itens[idx].lancado)
+            self._marcar_lancado(iid, not self.itens[idx].lancado)
         else:
             # Abre a janela de edição completa focando o campo clicado
             self._abrir_dialogo(iid, coluna_foco=coluna)
         return "break"
 
     def editar_qtd_selecionada(self):
-        self._editar_selecionada("#4")
+        self._editar_selecionada("#6")
 
     def _editar_selecionada(self, coluna: str):
         if self.ocupado:
@@ -1241,14 +1868,33 @@ class App:
             return
         self._abrir_dialogo(iid)
 
+    def _alternar_dobra_selecionada(self):
+        if self.ocupado:
+            return
+        iid = self._selecionada()
+        idx = self._idx_por_uid(iid)
+        if idx is None:
+            return
+        antigo = self.itens[idx]
+        nova_dobra = "NÃO" if normalizar_dobra(antigo.dobra) == "SIM" else "SIM"
+        novo_val = calcular_valor_unitario(
+            antigo.preco_base, antigo.peso, nova_dobra, self._ler_fator_dobra()
+        )
+        novo = antigo.model_copy(update={
+            "dobra": nova_dobra,
+            "valor_unitario": novo_val,
+            "valor_manual": False,
+        })
+        self._registrar_correcao(idx, antigo, novo)
+
     def _tecla_na_tabela(self, event):
-        """Digitar um número com a linha selecionada já começa a editar a Qtd (#4)."""
+        """Digitar um número com a linha selecionada já começa a editar a Qtd (#6)."""
         if self.ocupado:
             return None
         if event.char and event.char.isdigit():
             iid = self._selecionada()
             if iid:
-                self._editar_celula(iid, "#4", texto_inicial=event.char)
+                self._editar_celula(iid, "#6", texto_inicial=event.char)
                 return "break"
         elif event.keysym in ("plus", "KP_Add"):
             self._ajustar_qtd(+1)
@@ -1272,28 +1918,32 @@ class App:
         finally:
             self.menu.grab_release()
 
-    def _registrar_correcao(self, idx: int, antigo: ItemCorte, novo: ItemCorte):
-        """Atualiza o item e anota a correção manual na observação."""
+    def _registrar_correcao(self, alvo, antigo: ItemCorte, novo: ItemCorte):
+        """Atualiza o item sem aplicar normalizar_codigo (controle manual preservado)."""
+        idx = self._idx_por_uid(alvo)
+        if idx is None:
+            return
         novo = _normalizar_item(novo)
         notas = []
         if novo.quantidade_final != antigo.quantidade_final:
-            notas.append(f"qtd corrigida: {antigo.quantidade_final} → {novo.quantidade_final}")
+            notas.append(f"qtd: {antigo.quantidade_final} → {novo.quantidade_final}")
         if novo.codigo != antigo.codigo:
-            notas.append(f"código corrigido: {antigo.codigo} → {novo.codigo}")
+            notas.append(f"código: {antigo.codigo} → {novo.codigo}")
+        if novo.dobra != antigo.dobra:
+            notas.append(f"dobra: {antigo.dobra} → {novo.dobra}")
+        if novo.peso != antigo.peso:
+            notas.append(f"peso: {antigo.peso} → {novo.peso}")
         if novo.valor_unitario != antigo.valor_unitario:
             notas.append(f"valor: {antigo.valor_unitario} → {novo.valor_unitario}")
         if novo.local_destino != antigo.local_destino:
             notas.append(f"destino: {antigo.local_destino} → {novo.local_destino}")
-        if notas:
-            obs = novo.observacao
-            obs = (obs + " | " if obs else "") + "; ".join(notas)
-            novo = novo.model_copy(update={"observacao": obs})
         self.itens[idx] = novo
         self.atualizar_tabela()
-        iid = str(idx)
-        self.tree.selection_set(iid)
-        self.tree.focus(iid)
-        self.tree.see(iid)
+        iid = novo.uid
+        if iid in self.tree.get_children():
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.see(iid)
         self.tree.focus_set()
         if notas:
             self._set_status(f"✏️ Linha {idx + 1}: " + "; ".join(notas))
@@ -1302,9 +1952,9 @@ class App:
         if self.ocupado:
             return
         iid = self._selecionada()
-        if not iid:
+        idx = self._idx_por_uid(iid)
+        if idx is None:
             return
-        idx = int(iid)
         antigo = self.itens[idx]
         nova = max(0, antigo.quantidade_final + delta)
         if nova != antigo.quantidade_final:
@@ -1312,10 +1962,11 @@ class App:
                 idx, antigo, antigo.model_copy(update={"quantidade_final": nova}))
 
     def _editar_celula(self, iid: str, coluna: str, texto_inicial: str | None = None):
-        """Abre uma caixinha de edição em cima da célula (#1, #2, #3 ou #4)."""
+        """Abre uma caixinha de edição em cima da célula (#1 a #6)."""
         self._fechar_editor(salvar=True)
         campo = self.COLUNAS_EDITAVEIS.get(coluna)
-        if not campo or iid not in self.tree.get_children():
+        idx = self._idx_por_uid(iid)
+        if not campo or idx is None or iid not in self.tree.get_children():
             return
         self.tree.see(iid)
         self.tree.update_idletasks()
@@ -1323,7 +1974,6 @@ class App:
         if not bbox:
             return
         x, y, w, h = bbox
-        idx = int(iid)
         e_qtd = campo == "quantidade_final"
         item = self.itens[idx]
 
@@ -1345,7 +1995,7 @@ class App:
             ent.select_range(0, "end")
         ent.place(x=x, y=y, width=max(w, 60), height=h)
         ent.focus_set()
-        self._editor = (ent, idx, campo)
+        self._editor = (ent, iid, campo)
         self._set_status("✏️ Digite o novo valor e aperte Enter (Esc cancela).")
 
         ent.bind("<Return>", lambda _e: (self._fechar_editor(salvar=True), "break")[1])
@@ -1363,14 +2013,15 @@ class App:
     def _fechar_editor(self, salvar: bool):
         if not self._editor:
             return
-        ent, idx, campo = self._editor
+        ent, iid, campo = self._editor
         self._editor = None
         try:
             texto = ent.get().strip()
             ent.destroy()
         except tk.TclError:
             return
-        if not salvar or idx >= len(self.itens):
+        idx = self._idx_por_uid(iid)
+        if not salvar or idx is None:
             self._set_status("Edição cancelada.")
             return
         antigo = self.itens[idx]
@@ -1386,9 +2037,27 @@ class App:
                 self._set_status("O código não pode ficar vazio — mantido o anterior.")
                 return
             novo = antigo.model_copy(update={"codigo": texto})
+        elif campo == "dobra":
+            nova_dobra = normalizar_dobra(texto)
+            novo_val = calcular_valor_unitario(
+                antigo.preco_base, antigo.peso, nova_dobra, self._ler_fator_dobra()
+            )
+            novo = antigo.model_copy(update={
+                "dobra": nova_dobra, "valor_unitario": novo_val, "valor_manual": False,
+            })
+        elif campo == "peso":
+            novo_peso = _formatar_peso(texto)
+            novo_val = calcular_valor_unitario(
+                antigo.preco_base, novo_peso, antigo.dobra, self._ler_fator_dobra()
+            )
+            novo = antigo.model_copy(update={
+                "peso": novo_peso, "valor_unitario": novo_val, "valor_manual": False,
+            })
         elif campo == "valor_unitario":
-            novo = antigo.model_copy(
-                update={"valor_unitario": texto or VALOR_UNITARIO_PADRAO})
+            novo = antigo.model_copy(update={
+                "valor_unitario": _formatar_valor_unitario(texto) or VALOR_UNITARIO_PADRAO,
+                "valor_manual": True,
+            })
         elif campo == "local_destino":
             novo = antigo.model_copy(
                 update={"local_destino": texto or LOCAL_DESTINO_PADRAO})
@@ -1400,9 +2069,11 @@ class App:
             self.tree.focus_set()
 
     # ------------------------------------------------- janela de edição completa
-    def _abrir_dialogo(self, iid: str, coluna_foco: str = "#4"):
+    def _abrir_dialogo(self, iid: str, coluna_foco: str = "#6"):
         self._fechar_editor(salvar=True)
-        idx = int(iid)
+        idx = self._idx_por_uid(iid)
+        if idx is None:
+            return
         item = self.itens[idx]
 
         janela = tk.Toplevel(self.root)
@@ -1414,38 +2085,62 @@ class App:
         frm.pack(fill="both", expand=True)
 
         var_cod = tk.StringVar(value=item.codigo)
+        var_dob = tk.StringVar(value=normalizar_dobra(item.dobra))
+        var_pbase = tk.StringVar(value=item.preco_base)
+        var_peso = tk.StringVar(value=item.peso)
         var_val = tk.StringVar(value=item.valor_unitario)
         var_dst = tk.StringVar(value=item.local_destino)
         var_qtd = tk.StringVar(value=str(item.quantidade_final))
-        var_alt = tk.BooleanVar(value=item.alterado_a_mao)
         var_obs = tk.StringVar(value=item.observacao)
         var_dig = tk.BooleanVar(value=item.lancado)
+        val_editado_manual = [False]
 
         ttk.Label(frm, text="Código (Produto):").grid(row=0, column=0, sticky="w", pady=4)
         ent_cod = ttk.Entry(frm, textvariable=var_cod, width=42)
         ent_cod.grid(row=0, column=1, pady=4, sticky="w")
 
-        ttk.Label(frm, text="Valor Unitário:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(frm, text="Dobra:").grid(row=1, column=0, sticky="w", pady=4)
+        cmb_dob = ttk.Combobox(frm, textvariable=var_dob, values=("NÃO", "SIM"),
+                               state="readonly", width=13)
+        cmb_dob.grid(row=1, column=1, sticky="w", pady=4)
+
+        ttk.Label(frm, text="Preço Base:").grid(row=2, column=0, sticky="w", pady=4)
+        ent_pbase = ttk.Entry(frm, textvariable=var_pbase, width=16)
+        ent_pbase.grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Label(frm, text="Peso (kg):").grid(row=3, column=0, sticky="w", pady=4)
+        ent_peso = ttk.Entry(frm, textvariable=var_peso, width=16)
+        ent_peso.grid(row=3, column=1, sticky="w", pady=4)
+
+        ttk.Label(frm, text="Valor Unitário (Final):").grid(row=4, column=0, sticky="w", pady=4)
         ent_val = ttk.Entry(frm, textvariable=var_val, width=16)
-        ent_val.grid(row=1, column=1, sticky="w", pady=4)
+        ent_val.grid(row=4, column=1, sticky="w", pady=4)
 
-        ttk.Label(frm, text="Local de Destino:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(frm, text="Local de Destino:").grid(row=5, column=0, sticky="w", pady=4)
         ent_dst = ttk.Entry(frm, textvariable=var_dst, width=16)
-        ent_dst.grid(row=2, column=1, sticky="w", pady=4)
+        ent_dst.grid(row=5, column=1, sticky="w", pady=4)
 
-        ttk.Label(frm, text="Quantidade Final:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(frm, text="Quantidade:").grid(row=6, column=0, sticky="w", pady=4)
         ent_qtd = ttk.Entry(frm, textvariable=var_qtd, width=16)
-        ent_qtd.grid(row=3, column=1, sticky="w", pady=4)
+        ent_qtd.grid(row=6, column=1, sticky="w", pady=4)
 
-        ttk.Checkbutton(frm, text="Anotação manual (rasura à caneta)",
-                        variable=var_alt).grid(row=4, column=1, sticky="w", pady=4)
-
-        ttk.Label(frm, text="Observação:").grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Label(frm, text="Observação:").grid(row=7, column=0, sticky="w", pady=4)
         ent_obs = ttk.Entry(frm, textvariable=var_obs, width=42)
-        ent_obs.grid(row=5, column=1, pady=4, sticky="w")
+        ent_obs.grid(row=7, column=1, pady=4, sticky="w")
 
         ttk.Checkbutton(frm, text="Já lançado no WK Radar (✅)",
-                        variable=var_dig).grid(row=6, column=1, sticky="w", pady=4)
+                        variable=var_dig).grid(row=8, column=1, sticky="w", pady=4)
+
+        def _recalcular_no_dialogo(*_args):
+            val_editado_manual[0] = False
+            var_val.set(calcular_valor_unitario(
+                var_pbase.get(), var_peso.get(), var_dob.get(), self._ler_fator_dobra()
+            ))
+
+        var_dob.trace_add("write", _recalcular_no_dialogo)
+        var_pbase.trace_add("write", _recalcular_no_dialogo)
+        var_peso.trace_add("write", _recalcular_no_dialogo)
+        ent_val.bind("<Key>", lambda _e: val_editado_manual.__setitem__(0, True))
 
         def salvar(_e=None):
             codigo = var_cod.get().strip()
@@ -1461,32 +2156,44 @@ class App:
                                        parent=janela)
                 ent_qtd.focus_set()
                 return
-            valor_unit = var_val.get().strip() or VALOR_UNITARIO_PADRAO
+            dobra = normalizar_dobra(var_dob.get())
+            p_base_dec = _parse_decimal_seguro(var_pbase.get(), padrao=None)
+            preco_base = (
+                VALOR_UNITARIO_PADRAO
+                if p_base_dec is None
+                else str(p_base_dec).replace(".", ",")
+            )
+            peso = _formatar_peso(var_peso.get())
+            valor_unit = _formatar_valor_unitario(var_val.get())
             destino = var_dst.get().strip() or LOCAL_DESTINO_PADRAO
             marcado_lancado = var_dig.get()
-            novo = ItemCorte(
-                codigo=codigo,
-                valor_unitario=valor_unit,
-                local_destino=destino,
-                quantidade_final=qtd,
-                alterado_a_mao=var_alt.get(),
-                observacao=var_obs.get().strip(),
-                lancado=marcado_lancado,
-                erro_popup=False,
-                resolvida_manual=item.resolvida_manual if marcado_lancado else False,
-            )
+            novo = item.model_copy(update={
+                "codigo": codigo,
+                "dobra": dobra,
+                "preco_base": preco_base,
+                "peso": peso,
+                "valor_unitario": valor_unit,
+                "valor_manual": val_editado_manual[0] or (item.valor_manual and valor_unit == item.valor_unitario),
+                "local_destino": destino,
+                "quantidade_final": qtd,
+                "observacao": var_obs.get().strip(),
+                "lancado": marcado_lancado,
+                "erro_popup": False,
+                "nao_cadastrado": False,
+                "tipo_popup": "",
+                "resolvida_manual": item.resolvida_manual if marcado_lancado else False,
+            })
             janela.destroy()
             self._registrar_correcao(idx, item, novo)
 
         botoes = ttk.Frame(frm)
-        botoes.grid(row=7, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        botoes.grid(row=9, column=0, columnspan=2, pady=(12, 0), sticky="e")
         ttk.Button(botoes, text="Salvar", command=salvar).pack(side="right", padx=4)
         ttk.Button(botoes, text="Cancelar", command=janela.destroy).pack(side="right")
 
         janela.bind("<Return>", salvar)
         janela.bind("<Escape>", lambda _e: janela.destroy())
 
-        # centraliza sobre a janela principal
         janela.update_idletasks()
         x = self.root.winfo_rootx() + (self.root.winfo_width() - janela.winfo_width()) // 2
         y = self.root.winfo_rooty() + (self.root.winfo_height() - janela.winfo_height()) // 2
@@ -1500,14 +2207,16 @@ class App:
 
         mapa_foco = {
             "#1": ent_cod,
-            "#2": ent_val,
-            "#3": ent_dst,
-            "#4": ent_qtd,
-            "#6": ent_obs,
+            "#2": cmb_dob,
+            "#3": ent_peso,
+            "#4": ent_val,
+            "#5": ent_dst,
+            "#6": ent_qtd,
         }
         alvo = mapa_foco.get(coluna_foco, ent_qtd)
         alvo.focus_set()
-        alvo.select_range(0, "end")
+        if isinstance(alvo, ttk.Entry):
+            alvo.select_range(0, "end")
 
     # ------------------------------------ atalhos globais (F12 pausa / Esc para)
     def _monitorar_atalhos_globais(self):
@@ -1619,13 +2328,13 @@ class App:
         self._fechar_editor(salvar=True)
         if not self._garantir_calibrado():
             return
-        com_qtd = [(idx, it) for idx, it in enumerate(self.itens) if it.quantidade_final > 0]
+        com_qtd = [(it.uid, it) for it in self.itens if it.quantidade_final > 0]
         if not com_qtd:
             messagebox.showwarning("Nada para digitar",
                                    "Não há itens com quantidade maior que zero.")
             return
 
-        pendentes = [(idx, it) for idx, it in com_qtd if not it.lancado]
+        pendentes = [(uid, it) for uid, it in com_qtd if not it.lancado]
         if not pendentes:
             if not messagebox.askyesno(
                 "Tudo já lançado",
@@ -1634,8 +2343,7 @@ class App:
             ):
                 return
             self.desmarcar_todos_digitados()
-            pendentes = [(idx, it) for idx, it in enumerate(self.itens)
-                         if it.quantidade_final > 0]
+            pendentes = [(it.uid, it) for it in self.itens if it.quantidade_final > 0]
 
         self._iniciar_fila_digitacao(pendentes)
 
@@ -1647,15 +2355,14 @@ class App:
         if not self._garantir_calibrado():
             return
         iid = self._selecionada()
-        if iid is None:
+        idx_inicio = self._idx_por_uid(iid)
+        if idx_inicio is None:
             messagebox.showinfo(
                 "Digitar da Linha Selecionada",
                 "Selecione na tabela a linha a partir da qual deseja começar a digitar.",
             )
             return
-        idx_inicio = int(iid)
-        fila = [(idx, self.itens[idx]) for idx in range(idx_inicio, len(self.itens))
-                if self.itens[idx].quantidade_final > 0]
+        fila = [(it.uid, it) for it in self.itens[idx_inicio:] if it.quantidade_final > 0]
         if not fila:
             messagebox.showwarning(
                 "Nada para digitar",
@@ -1664,7 +2371,7 @@ class App:
             return
         self._iniciar_fila_digitacao(fila)
 
-    def _iniciar_fila_digitacao(self, fila: list[tuple[int, ItemCorte]]):
+    def _iniciar_fila_digitacao(self, fila: list[tuple[str | int, ItemCorte]]):
         if not self._garantir_calibrado():
             return
         setas_operacao = self._ler_setas_operacao()
@@ -1680,7 +2387,7 @@ class App:
         self._esc_anterior = _tecla_pressionada_global(VK_ESCAPE)
         self._f12_anterior = _tecla_pressionada_global(VK_F12)
         self._set_ocupado(True, modo="digitacao")
-        copia_fila = [(idx, it.model_copy()) for idx, it in fila]
+        copia_fila = [(alvo, it.model_copy()) for alvo, it in fila]
         self._set_status(
             f"⌨️ Digitando no WK Radar (Operação {self.pos_operacao[0]},{self.pos_operacao[1]} • "
             f"Produto {self.pos_produto[0]},{self.pos_produto[1]})... [F12 pausa • Esc para]"
@@ -1710,23 +2417,193 @@ class App:
             restante -= t
         return self._aguardar_pausa_ou_parada()
 
-    def _digitar(self, fila: list[tuple[int, ItemCorte]],
+    def _digitar(self, fila: list[tuple[str | int, ItemCorte]],
                  pos_operacao, pos_produto, hwnd_wk: int,
                  setas_operacao: int, enters_apos_qtd: int, espera_apos_ok: float,
                  espera_apos_produto: float = ESPERA_APOS_PRODUTO):
         total = len(fila)
         digitados_agora = 0
+        pulados_agora = 0
+        operacao_ja_selecionada = False
 
-        def checar_popup(idx_atual: int, codigo_atual: str) -> bool:
-            if verificar_popup(hwnd_wk):
-                titulo_popup = obter_titulo_janela(obter_hwnd_ativo())
-                try:
-                    winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-                except Exception:
-                    pass
-                self.root.after(0, self._pausar_por_popup, idx_atual, codigo_atual, titulo_popup)
-                return True
-            return False
+        def checar_popup(idx_atual, codigo_atual: str) -> str:
+            if not verificar_popup(hwnd_wk):
+                return "OK"
+
+            hwnd_popup = obter_hwnd_ativo()
+            titulo_popup = obter_titulo_janela(hwnd_popup)
+            tipo = classificar_popup(hwnd_popup)
+
+            if tipo == "NAO_CADASTRADO":
+                pyautogui.press("esc")
+                if self._dormir_interrompivel(0.35):
+                    return "PARAR"
+                if verificar_popup(hwnd_wk):
+                    pyautogui.press("enter")
+                    if self._dormir_interrompivel(0.35):
+                        return "PARAR"
+                if not verificar_popup(hwnd_wk):
+                    if self._dormir_interrompivel(0.2):
+                        return "PARAR"
+                    limpar_campo_produto_apos_popup()
+                    if self._aguardar_pausa_ou_parada():
+                        return "PARAR"
+                    self.root.after(0, self._marcar_nao_cadastrado, idx_atual)
+                    return "PULAR"
+                # Trava de segurança: não fechou com Esc nem Enter -> pausa normal
+                tipo = "OUTRO"
+
+            try:
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+            self.root.after(
+                0, self._pausar_por_popup, idx_atual, codigo_atual, titulo_popup, tipo
+            )
+            return "PAUSAR"
+
+        def _lancar_uma_peca(idx, item: ItemCorte, pular_operacao: bool = False) -> str:
+            # 1. Selecionar "Entrada da Produção" com reset pela tecla Home
+            if not pular_operacao:
+                res = checar_popup(idx, item.codigo)
+                if res != "OK":
+                    return res
+                pyautogui.click(pos_operacao)
+                if self._dormir_interrompivel(0.25):
+                    return "PARAR"
+
+                res = checar_popup(idx, item.codigo)
+                if res != "OK":
+                    return res
+                pyautogui.press("home")
+                if self._dormir_interrompivel(0.15):
+                    return "PARAR"
+
+                for s in range(setas_operacao):
+                    res = checar_popup(idx, item.codigo)
+                    if res != "OK":
+                        return res
+                    pyautogui.press("down")
+                    if s < setas_operacao - 1 and self._dormir_interrompivel(0.1):
+                        return "PARAR"
+                if setas_operacao > 0 and self._dormir_interrompivel(0.15):
+                    return "PARAR"
+
+                res = checar_popup(idx, item.codigo)
+                if res != "OK":
+                    return res
+                pyautogui.press("enter")
+                if self._dormir_interrompivel(0.35):
+                    return "PARAR"
+
+            # 2. Pular direto para o campo Produto (ignorando campos dinâmicos no meio)
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            pyautogui.click(pos_produto)
+            if self._dormir_interrompivel(0.25 if pular_operacao else 0.35):
+                return "PARAR"
+
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            digitar_campo_seguro(item.codigo, limpar=True)
+            if self._aguardar_pausa_ou_parada():
+                return "PARAR"
+
+            # 3. Fluxo por Enter a partir de Produto
+            # Enter 1: sai de Produto / passa por Tipo de Estoque (consulta no banco)
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            pyautogui.press("enter")
+            if self._dormir_interrompivel(espera_apos_produto):
+                return "PARAR"
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+
+            # Enter 2: vai para Valor Unitário
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            pyautogui.press("enter")
+            if self._dormir_interrompivel(0.25):
+                return "PARAR"
+
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            valor_unit = (item.valor_unitario or "").strip() or VALOR_UNITARIO_PADRAO
+            digitar_campo_seguro(valor_unit, limpar=True)
+            if self._aguardar_pausa_ou_parada():
+                return "PARAR"
+
+            # Enter 3: vai para Local de Destino (aguarda 1.5s, limpa e digita destino)
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            pyautogui.press("enter")
+            if self._dormir_interrompivel(1.5):
+                return "PARAR"
+
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            destino_val = (item.local_destino or "").strip() or LOCAL_DESTINO_PADRAO
+            digitar_campo_seguro(destino_val, limpar=True)
+            if self._aguardar_pausa_ou_parada():
+                return "PARAR"
+
+            # Enter 4: sai de Local de Destino / campo intermediário
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            pyautogui.press("enter")
+            if self._dormir_interrompivel(0.25):
+                return "PARAR"
+
+            # Enter 5: vai para Quantidade
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            pyautogui.press("enter")
+            if self._dormir_interrompivel(0.25):
+                return "PARAR"
+
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            digitar_campo_seguro(str(item.quantidade_final), limpar=True)
+            if self._aguardar_pausa_ou_parada():
+                return "PARAR"
+
+            # Enters finais até o OK
+            for _ in range(enters_apos_qtd):
+                res = checar_popup(idx, item.codigo)
+                if res != "OK":
+                    return res
+                pyautogui.press("enter")
+                if self._dormir_interrompivel(0.12):
+                    return "PARAR"
+
+            # 15. Monitoramento ativo pós-OK (checa pop-up a cada 0.1s durante espera_apos_ok)
+            restante_ok = espera_apos_ok
+            while restante_ok > 0:
+                if self._aguardar_pausa_ou_parada():
+                    return "PARAR"
+                res = checar_popup(idx, item.codigo)
+                if res != "OK":
+                    return res
+                passo_ok = min(0.1, restante_ok)
+                time.sleep(passo_ok)
+                restante_ok -= passo_ok
+            if self.parar_solicitado:
+                return "PARAR"
+            res = checar_popup(idx, item.codigo)
+            if res != "OK":
+                return res
+            return "LANCADO"
 
         try:
             # Minimiza o aplicativo e garante o foco no WK Radar antes de iniciar
@@ -1769,142 +2646,25 @@ class App:
                     )
                     return
 
+                idx_exib = self._idx_por_uid(idx)
+                linha_lbl = f"linha {idx_exib + 1}" if idx_exib is not None else "item"
                 self.root.after(
                     0, self._set_status,
-                    f"⌨️ Digitando {pos}/{total} (linha {idx + 1}): {item.codigo} "
+                    f"⌨️ Digitando {pos}/{total} ({linha_lbl}): {item.codigo} "
                     f"(qtd {item.quantidade_final})  [F12 pausa • Esc para]"
                 )
 
-                # 1. Selecionar "Entrada da Produção" com reset pela tecla Home
-                if checar_popup(idx, item.codigo):
+                pular_op = operacao_ja_selecionada
+                operacao_ja_selecionada = False
+                resultado = _lancar_uma_peca(idx, item, pular_operacao=pular_op)
+                if resultado == "PAUSAR":
                     return
-                pyautogui.click(pos_operacao)
-                if self._dormir_interrompivel(0.25):
+                if resultado == "PARAR":
                     break
-
-                if checar_popup(idx, item.codigo):
-                    return
-                pyautogui.press("home")
-                if self._dormir_interrompivel(0.15):
-                    break
-
-                parou_nas_setas = False
-                for s in range(setas_operacao):
-                    if checar_popup(idx, item.codigo):
-                        return
-                    pyautogui.press("down")
-                    if s < setas_operacao - 1:
-                        if self._dormir_interrompivel(0.1):
-                            parou_nas_setas = True
-                            break
-                if parou_nas_setas:
-                    break
-                if setas_operacao > 0 and self._dormir_interrompivel(0.15):
-                    break
-
-                if checar_popup(idx, item.codigo):
-                    return
-                pyautogui.press("enter")
-                if self._dormir_interrompivel(0.35):
-                    break
-
-                # 2. Pular direto para o campo Produto (ignorando campos dinâmicos no meio)
-                if checar_popup(idx, item.codigo):
-                    return
-                pyautogui.click(pos_produto)
-                if self._dormir_interrompivel(0.35):
-                    break
-
-                if checar_popup(idx, item.codigo):
-                    return
-                digitar_campo_seguro(item.codigo, limpar=True)
-                if self._aguardar_pausa_ou_parada():
-                    break
-
-                # 3. Fluxo por Enter a partir de Produto
-                # Enter 1: sai de Produto / passa por Tipo de Estoque (consulta no banco)
-                if checar_popup(idx, item.codigo):
-                    return
-                pyautogui.press("enter")
-                if self._dormir_interrompivel(espera_apos_produto):
-                    break
-                if checar_popup(idx, item.codigo):
-                    return
-
-                # Enter 2: vai para Valor Unitário
-                if checar_popup(idx, item.codigo):
-                    return
-                pyautogui.press("enter")
-                if self._dormir_interrompivel(0.25):
-                    break
-
-                if checar_popup(idx, item.codigo):
-                    return
-                valor_unit = (item.valor_unitario or "").strip() or VALOR_UNITARIO_PADRAO
-                digitar_campo_seguro(valor_unit, limpar=True)
-                if self._aguardar_pausa_ou_parada():
-                    break
-
-                # Enter 3: vai para Local de Destino (aguarda 1.5s, limpa e digita destino)
-                if checar_popup(idx, item.codigo):
-                    return
-                pyautogui.press("enter")
-                if self._dormir_interrompivel(1.5):
-                    break
-
-                if checar_popup(idx, item.codigo):
-                    return
-                destino_val = (item.local_destino or "").strip() or LOCAL_DESTINO_PADRAO
-                digitar_campo_seguro(destino_val, limpar=True)
-                if self._aguardar_pausa_ou_parada():
-                    break
-
-                # Enter 4: sai de Local de Destino / campo intermediário
-                if checar_popup(idx, item.codigo):
-                    return
-                pyautogui.press("enter")
-                if self._dormir_interrompivel(0.25):
-                    break
-
-                # Enter 5: vai para Quantidade
-                if checar_popup(idx, item.codigo):
-                    return
-                pyautogui.press("enter")
-                if self._dormir_interrompivel(0.25):
-                    break
-
-                if checar_popup(idx, item.codigo):
-                    return
-                digitar_campo_seguro(str(item.quantidade_final), limpar=True)
-                if self._aguardar_pausa_ou_parada():
-                    break
-
-                # Enters finais até o OK
-                parou_nos_enters = False
-                for _ in range(enters_apos_qtd):
-                    if checar_popup(idx, item.codigo):
-                        return
-                    pyautogui.press("enter")
-                    if self._dormir_interrompivel(0.12):
-                        parou_nos_enters = True
-                        break
-                if parou_nos_enters:
-                    break
-
-                # 15. Monitoramento ativo pós-OK (checa pop-up a cada 0.1s durante espera_apos_ok)
-                restante_ok = espera_apos_ok
-                while restante_ok > 0:
-                    if self._aguardar_pausa_ou_parada():
-                        break
-                    if checar_popup(idx, item.codigo):
-                        return
-                    passo_ok = min(0.1, restante_ok)
-                    time.sleep(passo_ok)
-                    restante_ok -= passo_ok
-                if self.parar_solicitado:
-                    break
-                if checar_popup(idx, item.codigo):
-                    return
+                if resultado == "PULAR":
+                    pulados_agora += 1
+                    operacao_ja_selecionada = True
+                    continue
 
                 digitados_agora += 1
                 self.root.after(0, self._marcar_lancado, idx, True, False)
@@ -1924,39 +2684,47 @@ class App:
         except Exception as e:
             self.root.after(0, self._fim_digitacao, f"❌ Erro na digitação: {e}")
             return
-        self.root.after(
-            0, self._fim_digitacao,
-            f"✅ Concluído! {digitados_agora} itens lançados no WK Radar."
-        )
+        msg_final = f"✅ Concluído! {digitados_agora} itens lançados no WK Radar."
+        if pulados_agora > 0:
+            msg_final = (
+                f"✅ Concluído! {digitados_agora} lançado(s) e "
+                f"{pulados_agora} pulado(s) (não cadastrado)."
+            )
+        self.root.after(0, self._fim_digitacao, msg_final)
 
-    def _pausar_por_popup(self, idx: int, codigo: str, titulo_popup: str):
+    def _pausar_por_popup(self, alvo, codigo: str, titulo_popup: str,
+                          tipo_popup: str = "OUTRO"):
         self.digitando = False
         self.pausado = False
         self.parar_solicitado = False
-        self.idx_pausado_popup = idx
-        self._marcar_popup_item(idx)
+        idx = self._idx_por_uid(alvo)
+        self.uid_pausado_popup = self.itens[idx].uid if idx is not None else None
+        if self.uid_pausado_popup is not None:
+            self._marcar_popup_item(self.uid_pausado_popup, tipo_popup=tipo_popup)
         self._set_ocupado(False)
+        motivo = "FALTA DE MATERIAL" if tipo_popup == "FALTA_MATERIAL" else "POP-UP"
         self._set_status(
-            f"⚠️ PAUSADO POR POP-UP na peça '{codigo}' — Janela: {titulo_popup}"
+            f"⚠️ PAUSADO POR {motivo} na peça '{codigo}' — Janela: {titulo_popup}"
         )
         self._restaurar_janela_app()
 
     def continuar_proxima_peca(self):
         """Marca a peça pausada como resolvida manualmente e retoma pela próxima."""
-        if self.ocupado or self.idx_pausado_popup is None:
+        if self.ocupado or self.uid_pausado_popup is None:
             return
         if not self._garantir_calibrado():
             return
-        if not (0 <= self.idx_pausado_popup < len(self.itens)):
+        idx_pausado = self._idx_por_uid(self.uid_pausado_popup)
+        if idx_pausado is None:
             self._limpar_estado_popup()
             return
-        idx_pausado = self.idx_pausado_popup
-        self._marcar_lancado(idx_pausado, True, resolvida_manual=True)
+        uid_pausado = self.itens[idx_pausado].uid
+        self._marcar_lancado(uid_pausado, True, resolvida_manual=True)
         self._limpar_estado_popup()
         fila = [
-            (i, self.itens[i])
-            for i in range(idx_pausado + 1, len(self.itens))
-            if self.itens[i].quantidade_final > 0 and not self.itens[i].lancado
+            (it.uid, it)
+            for it in self.itens[idx_pausado + 1:]
+            if it.quantidade_final > 0 and not it.lancado
         ]
         if not fila:
             self._set_status("✅ Peça marcada como resolvida manual. Não há mais peças pendentes.")
@@ -1965,20 +2733,21 @@ class App:
 
     def repetir_peca_pausada(self):
         """Retoma a digitação começando novamente pela peça onde ocorreu o pop-up."""
-        if self.ocupado or self.idx_pausado_popup is None:
+        if self.ocupado or self.uid_pausado_popup is None:
             return
         if not self._garantir_calibrado():
             return
-        if not (0 <= self.idx_pausado_popup < len(self.itens)):
+        idx_pausado = self._idx_por_uid(self.uid_pausado_popup)
+        if idx_pausado is None:
             self._limpar_estado_popup()
             return
-        idx_pausado = self.idx_pausado_popup
-        self._marcar_lancado(idx_pausado, False, resolvida_manual=False)
+        uid_pausado = self.itens[idx_pausado].uid
+        self._marcar_lancado(uid_pausado, False, resolvida_manual=False)
         self._limpar_estado_popup()
         fila = [
-            (i, self.itens[i])
-            for i in range(idx_pausado, len(self.itens))
-            if self.itens[i].quantidade_final > 0 and not self.itens[i].lancado
+            (it.uid, it)
+            for it in self.itens[idx_pausado:]
+            if it.quantidade_final > 0 and not it.lancado
         ]
         if not fila:
             self._set_status("Não há peças pendentes a partir da linha pausada.")
