@@ -135,7 +135,7 @@ class ItemCorte(BaseModel):
                     "letras no meio ou no final do código)."
     )
     dobra: str = Field(default="NÃO")
-    preco_base: str = Field(default=VALOR_UNITARIO_PADRAO)
+    preco_base: Decimal = Field(default=Decimal("0"))
     peso: str = Field(default="0")
     valor_unitario: str = Field(
         default=VALOR_UNITARIO_PADRAO,
@@ -156,6 +156,11 @@ class ItemCorte(BaseModel):
     nao_cadastrado: SkipJsonSchema[bool] = Field(default=False, exclude=True)
     tipo_popup: SkipJsonSchema[str] = Field(default="", exclude=True)
     resolvida_manual: SkipJsonSchema[bool] = Field(default=False, exclude=True)
+
+    @field_validator("preco_base", mode="before")
+    @classmethod
+    def _validar_preco_base(cls, v):
+        return _parse_decimal_seguro(v, padrao=Decimal("0")) or Decimal("0")
 
     @field_validator("valor_unitario", mode="before")
     @classmethod
@@ -670,12 +675,44 @@ def calcular_valor_unitario(preco_base, peso, dobra,
     return f"{valor_final.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}".replace(".", ",")
 
 
-def _formatar_valor_unitario(texto: str) -> str:
-    """Formata um valor numérico editado manualmente para 2 casas decimais com vírgula."""
-    d = _parse_decimal_seguro(texto, padrao=None)
+def _formatar_valor_unitario(valor) -> str:
+    """Formata um valor numérico para 2 casas decimais com vírgula."""
+    d = _parse_decimal_seguro(valor, padrao=None)
     if d is None:
         return VALOR_UNITARIO_PADRAO
     return f"{d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}".replace(".", ",")
+
+
+def _formatar_preco_base(valor) -> str:
+    """Formata preco_base com vírgula, mínimo 2 casas e 3ª casa preservada se != 0."""
+    d = _parse_decimal_seguro(valor, padrao=Decimal("0")) or Decimal("0")
+    d_3 = d.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    s_3 = f"{d_3:.3f}"
+    if s_3.endswith("0"):
+        return f"{d_3.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}".replace(".", ",")
+    return s_3.replace(".", ",")
+
+
+def gerar_observacao_dobra(
+    preco_base, peso, fator_dobra, valor_final, dobra
+) -> str:
+    """Gera texto 'Original + Dobra → Final' para Dobra == 'SIM'; vazio caso contrário."""
+    if str(dobra or "").strip().upper() != "SIM":
+        return ""
+    p_base = _parse_decimal_seguro(preco_base, padrao=Decimal("0")) or Decimal("0")
+    p_peso = _parse_decimal_seguro(peso, padrao=Decimal("0")) or Decimal("0")
+    fator = _parse_decimal_seguro(fator_dobra, padrao=FATOR_DOBRA_PADRAO)
+    if fator is None:
+        fator = FATOR_DOBRA_PADRAO
+
+    acrescimo_dobra = (p_peso * fator).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    acrescimo_fmt = f"{acrescimo_dobra:.2f}".replace(".", ",")
+    preco_base_fmt = _formatar_preco_base(p_base)
+    valor_final_fmt = _formatar_valor_unitario(valor_final)
+    return (
+        f"Original: R$ {preco_base_fmt} + Dobra: R$ {acrescimo_fmt} "
+        f"→ Final: R$ {valor_final_fmt}"
+    )
 
 
 def normalizar_codigo(codigo: str) -> str:
@@ -732,27 +769,23 @@ def _montar_item_corte(
         return None
 
     dobra_norm = normalizar_dobra(dobra_bruta)
-    p_base_dec = _parse_decimal_seguro(preco_bruto, padrao=None)
-    preco_base_str = (
-        VALOR_UNITARIO_PADRAO
-        if p_base_dec is None
-        else str(p_base_dec).replace(".", ",")
-    )
+    p_base_dec = _parse_decimal_seguro(preco_bruto, padrao=Decimal("0")) or Decimal("0")
     peso_dec = _parse_decimal_seguro(peso_bruto, padrao=Decimal("0")) or Decimal("0")
     peso_str = _formatar_peso(peso_dec)
     valor_final = calcular_valor_unitario(p_base_dec, peso_dec, dobra_norm, fator_dobra)
+    obs = gerar_observacao_dobra(p_base_dec, peso_dec, fator_dobra, valor_final, dobra_norm)
 
     return ItemCorte(
         codigo=codigo_limpo,
         dobra=dobra_norm,
-        preco_base=preco_base_str,
+        preco_base=p_base_dec,
         peso=peso_str,
         valor_unitario=valor_final,
         valor_manual=False,
         local_destino=LOCAL_DESTINO_PADRAO,
         quantidade_final=max(0, int(quantidade)),
         alterado_a_mao=False,
-        observacao="",
+        observacao=obs,
     )
 
 
@@ -1080,8 +1113,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Leitor de Corte a Laser → WK Radar (Entrada da Produção)")
-        self.root.geometry("1180x720")
-        self.root.minsize(980, 560)
+        self.root.geometry("1260x720")
+        self.root.minsize(1040, 560)
 
         self.itens: list[ItemCorte] = []
         self.ocupado = False
@@ -1170,7 +1203,9 @@ class App:
         meio = ttk.Frame(self.root, padding=(10, 6, 10, 6))
         meio.pack(fill="both", expand=True)
 
-        colunas = ("codigo", "dobra", "peso", "valor_unit", "destino", "qtd", "status")
+        colunas = (
+            "codigo", "dobra", "peso", "valor_unit", "destino", "qtd", "status", "observacao"
+        )
         self.tree = ttk.Treeview(meio, columns=colunas, show="headings",
                                  selectmode="extended")
         self.tree.heading("codigo", text="Código")
@@ -1180,24 +1215,30 @@ class App:
         self.tree.heading("destino", text="Destino")
         self.tree.heading("qtd", text="Quantidade")
         self.tree.heading("status", text="Status")
+        self.tree.heading("observacao", text="Observação")
 
-        self.tree.column("codigo", width=230, anchor="w")
-        self.tree.column("dobra", width=85, anchor="center")
-        self.tree.column("peso", width=105, anchor="center")
-        self.tree.column("valor_unit", width=125, anchor="center")
-        self.tree.column("destino", width=85, anchor="center")
-        self.tree.column("qtd", width=105, anchor="center")
-        self.tree.column("status", width=220, anchor="center")
+        self.tree.column("codigo", width=190, anchor="w")
+        self.tree.column("dobra", width=70, anchor="center")
+        self.tree.column("peso", width=85, anchor="center")
+        self.tree.column("valor_unit", width=105, anchor="center")
+        self.tree.column("destino", width=70, anchor="center")
+        self.tree.column("qtd", width=85, anchor="center")
+        self.tree.column("status", width=165, anchor="center")
+        self.tree.column("observacao", width=330, minwidth=260, anchor="w")
 
         self.tree.tag_configure("dobra_sim", background=COR_DOBRA_SIM)
         self.tree.tag_configure("lancado", background=COR_LANCADO)
         self.tree.tag_configure("popup", background=COR_POPUP)
         self.tree.tag_configure("nao_cadastrado", background=COR_NAO_CADASTRADO)
 
-        scroll = ttk.Scrollbar(meio, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        scroll_y = ttk.Scrollbar(meio, orient="vertical", command=self.tree.yview)
+        scroll_x = ttk.Scrollbar(meio, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        meio.rowconfigure(0, weight=1)
+        meio.columnconfigure(0, weight=1)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        scroll_x.grid(row=1, column=0, sticky="ew")
 
         self.tree.bind("<Double-1>", self._duplo_clique)
         self.tree.bind("<Delete>", self.remover_selecionados)
@@ -1461,16 +1502,23 @@ class App:
             self.recalcular_valores_tabela(d)
 
     def recalcular_valores_tabela(self, fator_dobra: Decimal | None = None):
-        """Recalcula imediatamente Valor Unitário de itens não editados manualmente."""
+        """Recalcula Valor Unitário e Observação a partir do preco_base original."""
         fator = fator_dobra if fator_dobra is not None else self._ler_fator_dobra()
         filhos = set(self.tree.get_children())
         alterou = False
         for i, item in enumerate(self.itens):
             if item.valor_manual:
-                continue
-            novo_val = calcular_valor_unitario(item.preco_base, item.peso, item.dobra, fator)
-            if novo_val != item.valor_unitario:
-                item = item.model_copy(update={"valor_unitario": novo_val})
+                novo_val = item.valor_unitario
+            else:
+                novo_val = calcular_valor_unitario(item.preco_base, item.peso, item.dobra, fator)
+            nova_obs = gerar_observacao_dobra(
+                item.preco_base, item.peso, fator, novo_val, item.dobra
+            )
+            if novo_val != item.valor_unitario or nova_obs != item.observacao:
+                item = item.model_copy(update={
+                    "valor_unitario": novo_val,
+                    "observacao": nova_obs,
+                })
                 self.itens[i] = item
                 alterou = True
                 if item.uid in filhos:
@@ -1538,6 +1586,7 @@ class App:
             item.local_destino,
             item.quantidade_final,
             self._status_item_texto(item),
+            item.observacao,
         )
 
     def atualizar_tabela(self):
@@ -1842,6 +1891,8 @@ class App:
             return
         if coluna == "#7":                  # Status: alterna ✅ Lançado
             self._marcar_lancado(iid, not self.itens[idx].lancado)
+        elif coluna == "#8":                # Observação: coluna informativa
+            return "break"
         else:
             # Abre a janela de edição completa focando o campo clicado
             self._abrir_dialogo(iid, coluna_foco=coluna)
@@ -1877,13 +1928,18 @@ class App:
             return
         antigo = self.itens[idx]
         nova_dobra = "NÃO" if normalizar_dobra(antigo.dobra) == "SIM" else "SIM"
+        fator = self._ler_fator_dobra()
         novo_val = calcular_valor_unitario(
-            antigo.preco_base, antigo.peso, nova_dobra, self._ler_fator_dobra()
+            antigo.preco_base, antigo.peso, nova_dobra, fator
+        )
+        nova_obs = gerar_observacao_dobra(
+            antigo.preco_base, antigo.peso, fator, novo_val, nova_dobra
         )
         novo = antigo.model_copy(update={
             "dobra": nova_dobra,
             "valor_unitario": novo_val,
             "valor_manual": False,
+            "observacao": nova_obs,
         })
         self._registrar_correcao(idx, antigo, novo)
 
@@ -2039,24 +2095,44 @@ class App:
             novo = antigo.model_copy(update={"codigo": texto})
         elif campo == "dobra":
             nova_dobra = normalizar_dobra(texto)
+            fator = self._ler_fator_dobra()
             novo_val = calcular_valor_unitario(
-                antigo.preco_base, antigo.peso, nova_dobra, self._ler_fator_dobra()
+                antigo.preco_base, antigo.peso, nova_dobra, fator
+            )
+            nova_obs = gerar_observacao_dobra(
+                antigo.preco_base, antigo.peso, fator, novo_val, nova_dobra
             )
             novo = antigo.model_copy(update={
-                "dobra": nova_dobra, "valor_unitario": novo_val, "valor_manual": False,
+                "dobra": nova_dobra,
+                "valor_unitario": novo_val,
+                "valor_manual": False,
+                "observacao": nova_obs,
             })
         elif campo == "peso":
             novo_peso = _formatar_peso(texto)
+            fator = self._ler_fator_dobra()
             novo_val = calcular_valor_unitario(
-                antigo.preco_base, novo_peso, antigo.dobra, self._ler_fator_dobra()
+                antigo.preco_base, novo_peso, antigo.dobra, fator
+            )
+            nova_obs = gerar_observacao_dobra(
+                antigo.preco_base, novo_peso, fator, novo_val, antigo.dobra
             )
             novo = antigo.model_copy(update={
-                "peso": novo_peso, "valor_unitario": novo_val, "valor_manual": False,
+                "peso": novo_peso,
+                "valor_unitario": novo_val,
+                "valor_manual": False,
+                "observacao": nova_obs,
             })
         elif campo == "valor_unitario":
+            novo_val = _formatar_valor_unitario(texto) or VALOR_UNITARIO_PADRAO
+            fator = self._ler_fator_dobra()
+            nova_obs = gerar_observacao_dobra(
+                antigo.preco_base, antigo.peso, fator, novo_val, antigo.dobra
+            )
             novo = antigo.model_copy(update={
-                "valor_unitario": _formatar_valor_unitario(texto) or VALOR_UNITARIO_PADRAO,
+                "valor_unitario": novo_val,
                 "valor_manual": True,
+                "observacao": nova_obs,
             })
         elif campo == "local_destino":
             novo = antigo.model_copy(
@@ -2084,9 +2160,10 @@ class App:
         frm = ttk.Frame(janela, padding=15)
         frm.pack(fill="both", expand=True)
 
+        pbase_inicial = _formatar_preco_base(item.preco_base)
         var_cod = tk.StringVar(value=item.codigo)
         var_dob = tk.StringVar(value=normalizar_dobra(item.dobra))
-        var_pbase = tk.StringVar(value=item.preco_base)
+        var_pbase = tk.StringVar(value=pbase_inicial)
         var_peso = tk.StringVar(value=item.peso)
         var_val = tk.StringVar(value=item.valor_unitario)
         var_dst = tk.StringVar(value=item.local_destino)
@@ -2094,6 +2171,7 @@ class App:
         var_obs = tk.StringVar(value=item.observacao)
         var_dig = tk.BooleanVar(value=item.lancado)
         val_editado_manual = [False]
+        atualizando_auto = [False]
 
         ttk.Label(frm, text="Código (Produto):").grid(row=0, column=0, sticky="w", pady=4)
         ent_cod = ttk.Entry(frm, textvariable=var_cod, width=42)
@@ -2125,22 +2203,47 @@ class App:
         ent_qtd.grid(row=6, column=1, sticky="w", pady=4)
 
         ttk.Label(frm, text="Observação:").grid(row=7, column=0, sticky="w", pady=4)
-        ent_obs = ttk.Entry(frm, textvariable=var_obs, width=42)
+        ent_obs = ttk.Entry(frm, textvariable=var_obs, width=52, state="readonly")
         ent_obs.grid(row=7, column=1, pady=4, sticky="w")
 
         ttk.Checkbutton(frm, text="Já lançado no WK Radar (✅)",
                         variable=var_dig).grid(row=8, column=1, sticky="w", pady=4)
 
+        def _preco_base_corrente() -> Decimal:
+            txt_pbase = var_pbase.get().strip()
+            if txt_pbase == pbase_inicial:
+                return item.preco_base
+            return _parse_decimal_seguro(txt_pbase, padrao=Decimal("0")) or Decimal("0")
+
         def _recalcular_no_dialogo(*_args):
-            val_editado_manual[0] = False
-            var_val.set(calcular_valor_unitario(
-                var_pbase.get(), var_peso.get(), var_dob.get(), self._ler_fator_dobra()
-            ))
+            atualizando_auto[0] = True
+            try:
+                val_editado_manual[0] = False
+                fator = self._ler_fator_dobra()
+                p_base = _preco_base_corrente()
+                novo_val = calcular_valor_unitario(p_base, var_peso.get(), var_dob.get(), fator)
+                var_val.set(novo_val)
+                var_obs.set(
+                    gerar_observacao_dobra(p_base, var_peso.get(), fator, novo_val, var_dob.get())
+                )
+            finally:
+                atualizando_auto[0] = False
+
+        def _ao_mudar_val_no_dialogo(*_args):
+            if atualizando_auto[0]:
+                return
+            val_editado_manual[0] = True
+            fator = self._ler_fator_dobra()
+            p_base = _preco_base_corrente()
+            val_fmt = _formatar_valor_unitario(var_val.get())
+            var_obs.set(
+                gerar_observacao_dobra(p_base, var_peso.get(), fator, val_fmt, var_dob.get())
+            )
 
         var_dob.trace_add("write", _recalcular_no_dialogo)
         var_pbase.trace_add("write", _recalcular_no_dialogo)
         var_peso.trace_add("write", _recalcular_no_dialogo)
-        ent_val.bind("<Key>", lambda _e: val_editado_manual.__setitem__(0, True))
+        var_val.trace_add("write", _ao_mudar_val_no_dialogo)
 
         def salvar(_e=None):
             codigo = var_cod.get().strip()
@@ -2157,26 +2260,23 @@ class App:
                 ent_qtd.focus_set()
                 return
             dobra = normalizar_dobra(var_dob.get())
-            p_base_dec = _parse_decimal_seguro(var_pbase.get(), padrao=None)
-            preco_base = (
-                VALOR_UNITARIO_PADRAO
-                if p_base_dec is None
-                else str(p_base_dec).replace(".", ",")
-            )
+            fator = self._ler_fator_dobra()
+            p_base_dec = _preco_base_corrente()
             peso = _formatar_peso(var_peso.get())
             valor_unit = _formatar_valor_unitario(var_val.get())
+            obs_final = gerar_observacao_dobra(p_base_dec, peso, fator, valor_unit, dobra)
             destino = var_dst.get().strip() or LOCAL_DESTINO_PADRAO
             marcado_lancado = var_dig.get()
             novo = item.model_copy(update={
                 "codigo": codigo,
                 "dobra": dobra,
-                "preco_base": preco_base,
+                "preco_base": p_base_dec,
                 "peso": peso,
                 "valor_unitario": valor_unit,
                 "valor_manual": val_editado_manual[0] or (item.valor_manual and valor_unit == item.valor_unitario),
                 "local_destino": destino,
                 "quantidade_final": qtd,
-                "observacao": var_obs.get().strip(),
+                "observacao": obs_final,
                 "lancado": marcado_lancado,
                 "erro_popup": False,
                 "nao_cadastrado": False,

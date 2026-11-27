@@ -8,7 +8,16 @@ if exist ".venv\Scripts\activate.bat" (
     echo [AVISO] Ambiente virtual .venv nao encontrado. Usando o Python do sistema.
 )
 
-pyinstaller --onefile --windowed --name "LeitorCorteLaser" main.py
+taskkill /F /IM LeitorCorteLaser.exe >nul 2>&1
+if not errorlevel 1 timeout /t 1 /nobreak >nul
+
+pyinstaller --clean --noconfirm --onefile --windowed --name "LeitorCorteLaser" main.py
+if errorlevel 1 (
+    echo.
+    echo [ERRO] Falha ao gerar o executavel! Feche o LeitorCorteLaser.exe e tente novamente.
+    pause
+    exit /b 1
+)
 
 if exist ".env" copy /Y ".env" "dist\.env" >nul
 
